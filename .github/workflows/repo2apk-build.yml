@@ -128,11 +128,32 @@ jobs:
           if [[ ! -d "$SDK_ROOT" ]]; then
             SDK_ROOT="$HOME/Android/Sdk"
             mkdir -p "$SDK_ROOT"
+          elif [[ ! -O "$SDK_ROOT" || ! -w "$SDK_ROOT" ]]; then
+            if command -v sudo >/dev/null 2>&1 && sudo -n true 2>/dev/null; then
+              sudo -n chown -R "$(id -un):$(id -gn)" "$SDK_ROOT"
+              chmod -R u+rwX "$SDK_ROOT"
+            fi
+            if [[ ! -w "$SDK_ROOT" ]]; then
+              WRITABLE_SDK="$HOME/Android/Sdk"
+              mkdir -p "$WRITABLE_SDK/licenses"
+              for sub in "$SDK_ROOT"/*; do
+                [[ -e "$sub" ]] || continue
+                base="$(basename "$sub")"
+                if [[ "$base" == "licenses" || "$base" == ".temp" ]]; then
+                  continue
+                fi
+                ln -sfn "$sub" "$WRITABLE_SDK/$base"
+              done
+              if [[ -d "$SDK_ROOT/licenses" ]]; then
+                cp -rn "$SDK_ROOT/licenses/." "$WRITABLE_SDK/licenses/" 2>/dev/null || true
+              fi
+              SDK_ROOT="$WRITABLE_SDK"
+            fi
           fi
           echo "ANDROID_HOME=$SDK_ROOT" >> "$GITHUB_ENV"
           echo "ANDROID_SDK_ROOT=$SDK_ROOT" >> "$GITHUB_ENV"
 
-          SDKMANAGER="$(find "$SDK_ROOT/cmdline-tools" -name sdkmanager -type f 2>/dev/null | sort -V | tail -n 1 || true)"
+          SDKMANAGER="$(find -L "$SDK_ROOT/cmdline-tools" -name sdkmanager \( -type f -o -type l \) 2>/dev/null | sort -V | tail -n 1 || true)"
           if [[ -z "$SDKMANAGER" ]]; then
             echo "Downloading Android command-line tools..."
             mkdir -p "$SDK_ROOT/cmdline-tools"
@@ -141,7 +162,9 @@ jobs:
             mv "$RUNNER_TEMP/cmdline-extract/cmdline-tools" "$SDK_ROOT/cmdline-tools/latest"
             SDKMANAGER="$SDK_ROOT/cmdline-tools/latest/bin/sdkmanager"
           fi
-          chmod +x "$SDKMANAGER"
+          if [[ ! -x "$SDKMANAGER" ]]; then
+            chmod +x "$SDKMANAGER"
+          fi
           echo "Using sdkmanager: $SDKMANAGER"
 
           mkdir -p "$SDK_ROOT/licenses"
@@ -233,7 +256,7 @@ jobs:
               local dist_url
               dist_url="$(grep -E '^distributionUrl=' gradle/wrapper/gradle-wrapper.properties | head -n 1 | cut -d= -f2- | sed 's/\\:/:/g' | tr -d '\r')"
               local g_ver
-              g_ver="$(printf '%s' "$dist_url" | sed -n 's/.*gradle-\([0-9][0-9.]*\)-.*/\1/p')"
+              g_ver="$(printf '%s' "$dist_url" | sed -n 's/.*gradle-\([0-9A-Za-z._-]*\)-\(bin\|all\)\.zip.*/\1/p')"
               if [[ -n "$dist_url" ]]; then
                 local g_cache="$RUNNER_TEMP/repo2apk-gradle"
                 mkdir -p "$g_cache"
@@ -244,12 +267,14 @@ jobs:
                 fi
                 unzip -q -o "$g_cache/gradle.zip" -d "$g_cache"
                 local g_bin
-                g_bin="$(find "$g_cache" -maxdepth 3 -path '*/bin/gradle' -type f | head -n 1 || true)"
+                g_bin="$(find "$g_cache" -maxdepth 4 -path '*/bin/gradle' -type f | head -n 1 || true)"
                 if [[ -z "$g_bin" ]]; then
                   echo "Failed to extract Gradle executable from $dist_url" >&2
                   exit 1
                 fi
-                chmod +x "$g_bin"
+                if [[ ! -x "$g_bin" ]]; then
+                  chmod +x "$g_bin"
+                fi
                 echo "$env_var=$g_bin" >> "$GITHUB_ENV"
                 echo "Resolved Gradle executable: $g_bin"
               elif command -v gradle >/dev/null 2>&1; then
@@ -280,14 +305,14 @@ jobs:
               if grep -Rqs 'debug\.keystore' build.gradle* */build.gradle* 2>/dev/null; then
                 if [[ ! -f "debug.keystore" ]]; then
                   echo "Generating debug.keystore referenced by Gradle config..."
-                  keytool -genkeypair -noprompt -v \
+                  keytool -genkeypair -noprompt \
                     -keystore "debug.keystore" \
                     -alias androiddebugkey \
                     -keyalg RSA -keysize 2048 -validity 10000 \
                     -storepass android -keypass android \
                     -dname "CN=Android Debug,O=Android,C=US"
                 fi
-                if grep -Rqs 'app/debug\.keystore' build.gradle* */build.gradle* 2>/dev/null && [[ ! -f "app/debug.keystore" ]]; then
+                if [[ -d "app" && ! -f "app/debug.keystore" ]] && grep -Rqs 'debug\.keystore' app/build.gradle* 2>/dev/null; then
                   cp "debug.keystore" "app/debug.keystore"
                 fi
               fi
