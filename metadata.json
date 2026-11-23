@@ -1,0 +1,12 @@
+{
+  "name": "UltraCam",
+  "description": "Device-specific computational photography, RAW DNG capture, and pro Camera2 studio optimized for Samsung Galaxy A05s.",
+  "requestFramePermissions": [
+    "CAMERA",
+    "RECORD_AUDIO",
+    "ACCESS_COARSE_LOCATION"
+  ],
+  "majorCapabilities": [
+    "MAJOR_CAPABILITY_SERVER_SIDE_GEMINI_API"
+  ]
+}

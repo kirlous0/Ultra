@@ -1,0 +1,8 @@
+<?xml version="1.0" encoding="utf-8"?>
+<resources>
+    <style name="Theme.UltraCam" parent="android:Theme.DeviceDefault.NoActionBar">
+        <item name="android:windowBackground">#FF090B0E</item>
+        <item name="android:statusBarColor">#FF090B0E</item>
+        <item name="android:navigationBarColor">#FF090B0E</item>
+    </style>
+</resources>
