@@ -62,6 +62,11 @@ on:
         required: false
         default: "stable"
         type: string
+      compile_sdk:
+        description: "Detected Android compileSdk API level"
+        required: false
+        default: ""
+        type: string
       use_repo2apk_secrets:
         description: "Whether encrypted Repo2APK keystore secrets are attached"
         required: false
@@ -116,7 +121,52 @@ jobs:
           java-version: ${{ inputs.java_version }}
 
       - name: "[Stage 3] Setup Android SDK"
-        uses: android-actions/setup-android@v3
+        shell: bash
+        run: |
+          set -euo pipefail
+          SDK_ROOT="${ANDROID_HOME:-${ANDROID_SDK_ROOT:-/usr/local/lib/android/sdk}}"
+          if [[ ! -d "$SDK_ROOT" ]]; then
+            SDK_ROOT="$HOME/Android/Sdk"
+            mkdir -p "$SDK_ROOT"
+          fi
+          echo "ANDROID_HOME=$SDK_ROOT" >> "$GITHUB_ENV"
+          echo "ANDROID_SDK_ROOT=$SDK_ROOT" >> "$GITHUB_ENV"
+
+          SDKMANAGER="$(find "$SDK_ROOT/cmdline-tools" -name sdkmanager -type f 2>/dev/null | sort -V | tail -n 1 || true)"
+          if [[ -z "$SDKMANAGER" ]]; then
+            echo "Downloading Android command-line tools..."
+            mkdir -p "$SDK_ROOT/cmdline-tools"
+            curl -fsSL "https://dl.google.com/android/repository/commandlinetools-linux-11076708_latest.zip" -o "$RUNNER_TEMP/cmdline-tools.zip"
+            unzip -q "$RUNNER_TEMP/cmdline-tools.zip" -d "$RUNNER_TEMP/cmdline-extract"
+            mv "$RUNNER_TEMP/cmdline-extract/cmdline-tools" "$SDK_ROOT/cmdline-tools/latest"
+            SDKMANAGER="$SDK_ROOT/cmdline-tools/latest/bin/sdkmanager"
+          fi
+          chmod +x "$SDKMANAGER"
+          echo "Using sdkmanager: $SDKMANAGER"
+
+          mkdir -p "$SDK_ROOT/licenses"
+          printf '\n24333f8a63b6825ea9c5514f83c2829b004d1fee\n8933bad161af4178b1185d1a37fbf41ea5269c55\nd56f5187479451eabf01fb78af6dfcb131a6481e\n' > "$SDK_ROOT/licenses/android-sdk-license"
+          printf '\n84831b9409646a918e30573bab4c9c91346d8abd\n' > "$SDK_ROOT/licenses/android-sdk-preview-license"
+          (set +o pipefail; yes | "$SDKMANAGER" --sdk_root="$SDK_ROOT" --licenses >/dev/null 2>&1 || true)
+
+          if [[ ! -d "$SDK_ROOT/platform-tools" ]]; then
+            echo "Installing platform-tools..."
+            (set +o pipefail; yes | "$SDKMANAGER" --sdk_root="$SDK_ROOT" "platform-tools")
+          fi
+
+          COMPILE_SDK="${{ inputs.compile_sdk }}"
+          COMPILE_MAJOR="${COMPILE_SDK%%.*}"
+          if [[ "$COMPILE_MAJOR" =~ ^[0-9]+$ && ! -d "$SDK_ROOT/platforms/android-$COMPILE_MAJOR" ]]; then
+            echo "Installing Android SDK platform android-$COMPILE_MAJOR..."
+            (set +o pipefail; yes | "$SDKMANAGER" --sdk_root="$SDK_ROOT" "platforms;android-$COMPILE_MAJOR" || true)
+          fi
+          if [[ -n "$COMPILE_SDK" && "$COMPILE_SDK" != "$COMPILE_MAJOR" ]]; then
+            (set +o pipefail; yes | "$SDKMANAGER" --sdk_root="$SDK_ROOT" "platforms;android-$COMPILE_SDK" || true)
+          fi
+
+          echo "$SDK_ROOT/platform-tools" >> "$GITHUB_PATH"
+          echo "$(dirname "$SDKMANAGER")" >> "$GITHUB_PATH"
+          echo "Android SDK ready at $SDK_ROOT"
 
       - name: "[Stage 3] Setup Flutter SDK"
         if: inputs.framework == 'flutter'
@@ -151,7 +201,7 @@ jobs:
               npm install
             fi
           else
-            echo "Gradle dependencies will resolve during wrapper verification."
+            echo "Gradle dependencies will resolve during project configuration."
           fi
 
       - name: "[Stage 5] Android project configuration"
@@ -166,35 +216,110 @@ jobs:
           PROJ_DIR="${{ inputs.project_dir }}"
           cd "$PROJ_DIR"
 
-          if [[ "${{ inputs.framework }}" == "react_native" || "${{ inputs.framework }}" == "expo_bare" || "${{ inputs.framework }}" == "flutter" ]]; then
-            if [[ -f "android/gradlew" ]]; then
-              chmod +x android/gradlew
+          resolve_gradle_dir() {
+            local dir="$1"
+            local env_var="$2"
+            pushd "$dir" >/dev/null
+
+            if [[ ! -f "local.properties" && -n "${ANDROID_HOME:-}" ]]; then
+              printf 'sdk.dir=%s\n' "$ANDROID_HOME" > local.properties
+              echo "Configured sdk.dir in $dir/local.properties"
             fi
-          else
+
             if [[ -f "./gradlew" ]]; then
               chmod +x ./gradlew
-              echo "GRADLE_CMD=./gradlew" >> "$GITHUB_ENV"
-            elif command -v gradle >/dev/null 2>&1; then
-              echo "WARNING: ./gradlew not found in $PROJ_DIR; falling back to system gradle"
-              gradle wrapper --no-daemon || true
-              if [[ -f "./gradlew" ]]; then
-                chmod +x ./gradlew
-                echo "GRADLE_CMD=./gradlew" >> "$GITHUB_ENV"
+              echo "$env_var=./gradlew" >> "$GITHUB_ENV"
+            elif [[ -f "gradle/wrapper/gradle-wrapper.properties" ]]; then
+              local dist_url
+              dist_url="$(grep -E '^distributionUrl=' gradle/wrapper/gradle-wrapper.properties | head -n 1 | cut -d= -f2- | sed 's/\\:/:/g' | tr -d '\r')"
+              local g_ver
+              g_ver="$(printf '%s' "$dist_url" | sed -n 's/.*gradle-\([0-9][0-9.]*\)-.*/\1/p')"
+              if [[ -n "$dist_url" ]]; then
+                local g_cache="$RUNNER_TEMP/repo2apk-gradle"
+                mkdir -p "$g_cache"
+                echo "Downloading Gradle ${g_ver:-wrapper} from $dist_url..."
+                if ! curl -fsSL "$dist_url" -o "$g_cache/gradle.zip"; then
+                  local fallback_url="https://services.gradle.org/distributions/gradle-${g_ver}-bin.zip"
+                  curl -fsSL "$fallback_url" -o "$g_cache/gradle.zip"
+                fi
+                unzip -q -o "$g_cache/gradle.zip" -d "$g_cache"
+                local g_bin
+                g_bin="$(find "$g_cache" -maxdepth 3 -path '*/bin/gradle' -type f | head -n 1 || true)"
+                if [[ -z "$g_bin" ]]; then
+                  echo "Failed to extract Gradle executable from $dist_url" >&2
+                  exit 1
+                fi
+                chmod +x "$g_bin"
+                echo "$env_var=$g_bin" >> "$GITHUB_ENV"
+                echo "Resolved Gradle executable: $g_bin"
+              elif command -v gradle >/dev/null 2>&1; then
+                echo "WARNING: ./gradlew not found; using system gradle"
+                echo "$env_var=gradle" >> "$GITHUB_ENV"
               else
-                echo "GRADLE_CMD=gradle" >> "$GITHUB_ENV"
+                echo "Neither ./gradlew nor Gradle distribution found in $dir" >&2
+                exit 1
               fi
+            elif command -v gradle >/dev/null 2>&1; then
+              echo "WARNING: ./gradlew not found; using system gradle"
+              echo "$env_var=gradle" >> "$GITHUB_ENV"
             else
-              echo "Neither ./gradlew nor system gradle found in $PROJ_DIR" >&2
+              echo "Neither ./gradlew nor system gradle found in $dir" >&2
               exit 1
             fi
+
+            if [[ "${{ inputs.build_mode }}" == "debug" ]]; then
+              mkdir -p "$HOME/.android"
+              if [[ ! -f "$HOME/.android/debug.keystore" ]]; then
+                keytool -genkeypair -noprompt -v \
+                  -keystore "$HOME/.android/debug.keystore" \
+                  -alias androiddebugkey \
+                  -keyalg RSA -keysize 2048 -validity 10000 \
+                  -storepass android -keypass android \
+                  -dname "CN=Android Debug,O=Android,C=US" >/dev/null 2>&1 || true
+              fi
+              if grep -Rqs 'debug\.keystore' build.gradle* */build.gradle* 2>/dev/null; then
+                if [[ ! -f "debug.keystore" ]]; then
+                  echo "Generating debug.keystore referenced by Gradle config..."
+                  keytool -genkeypair -noprompt -v \
+                    -keystore "debug.keystore" \
+                    -alias androiddebugkey \
+                    -keyalg RSA -keysize 2048 -validity 10000 \
+                    -storepass android -keypass android \
+                    -dname "CN=Android Debug,O=Android,C=US"
+                fi
+                if grep -Rqs 'app/debug\.keystore' build.gradle* */build.gradle* 2>/dev/null && [[ ! -f "app/debug.keystore" ]]; then
+                  cp "debug.keystore" "app/debug.keystore"
+                fi
+              fi
+            fi
+
+            popd >/dev/null
+          }
+
+          if [[ ! -f ".env" && -f ".env.example" ]]; then
+            cp ".env.example" ".env"
+          fi
+
+          if [[ "${{ inputs.framework }}" == "react_native" || "${{ inputs.framework }}" == "expo_bare" || "${{ inputs.framework }}" == "flutter" ]]; then
+            if [[ -d "android" ]]; then
+              resolve_gradle_dir "android" "ANDROID_GRADLE_CMD"
+            fi
+          else
+            resolve_gradle_dir "." "GRADLE_CMD"
           fi
 
           mkdir -p "$RUNNER_TEMP/repo2apk-signing"
           if [[ "${{ inputs.use_repo2apk_secrets }}" == "true" && -n "${REPO2APK_KEYSTORE_BASE64:-}" ]]; then
             echo "::add-mask::$REPO2APK_STORE_PASSWORD"
             echo "::add-mask::$REPO2APK_KEY_PASSWORD"
-            printf '%s' "$REPO2APK_KEYSTORE_BASE64" | base64 -d > "$RUNNER_TEMP/repo2apk-signing/release.keystore"
+            echo "::add-mask::$REPO2APK_KEY_ALIAS"
+            KEYSTORE_FILE="$RUNNER_TEMP/repo2apk-signing/release.keystore"
+            printf '%s' "$REPO2APK_KEYSTORE_BASE64" | base64 -d > "$KEYSTORE_FILE"
             echo "HAS_KEYSTORE=true" >> "$GITHUB_ENV"
+            echo "KEYSTORE_PATH=$KEYSTORE_FILE" >> "$GITHUB_ENV"
+            echo "STORE_PASSWORD=$REPO2APK_STORE_PASSWORD" >> "$GITHUB_ENV"
+            echo "KEY_PASSWORD=$REPO2APK_KEY_PASSWORD" >> "$GITHUB_ENV"
+            echo "KEY_ALIAS=$REPO2APK_KEY_ALIAS" >> "$GITHUB_ENV"
           else
             echo "HAS_KEYSTORE=false" >> "$GITHUB_ENV"
           fi
@@ -231,12 +356,13 @@ jobs:
             "${CMD[@]}"
           elif [[ "${{ inputs.framework }}" == "react_native" || "${{ inputs.framework }}" == "expo_bare" ]]; then
             cd android
-            echo "Executing: ./gradlew $TASK --no-daemon"
-            ./gradlew "$TASK" --no-daemon
+            GRADLE_BIN="${ANDROID_GRADLE_CMD:-./gradlew}"
+            echo "Executing: $GRADLE_BIN $TASK --no-daemon --console=plain --stacktrace"
+            "$GRADLE_BIN" "$TASK" --no-daemon --console=plain --stacktrace
           else
             GRADLE_BIN="${GRADLE_CMD:-./gradlew}"
-            echo "Executing: $GRADLE_BIN $TASK --no-daemon"
-            "$GRADLE_BIN" "$TASK" --no-daemon
+            echo "Executing: $GRADLE_BIN $TASK --no-daemon --console=plain --stacktrace"
+            "$GRADLE_BIN" "$TASK" --no-daemon --console=plain --stacktrace
           fi
 
       - name: "[Stage 7] APK validation & metadata"
@@ -252,7 +378,10 @@ jobs:
           OUT_DIR="$RUNNER_TEMP/repo2apk-output"
           mkdir -p "$OUT_DIR"
 
-          APK_PATH="$(find . -type f -path '*/outputs/apk/*' -name '*.apk' ! -name '*androidTest*' ! -name '*-unaligned*' | head -n 1 || true)"
+          APK_PATH="$(find . -type f -path '*/outputs/apk/*' -name '*.apk' ! -name '*androidTest*' ! -name '*-unaligned*' | grep -E 'universal|arm64-v8a' | head -n 1 || true)"
+          if [[ -z "$APK_PATH" ]]; then
+            APK_PATH="$(find . -type f -path '*/outputs/apk/*' -name '*.apk' ! -name '*androidTest*' ! -name '*-unaligned*' | head -n 1 || true)"
+          fi
           if [[ -z "$APK_PATH" ]]; then
             APK_PATH="$(find . -type f -name '*.apk' ! -path '*/intermediates/*' ! -name '*androidTest*' ! -name '*-unaligned*' | head -n 1 || true)"
           fi
@@ -274,7 +403,12 @@ jobs:
             SIGNING_STATUS="debug_signed"
             IS_SIGNED="true"
           elif [[ "${HAS_KEYSTORE:-false}" == "true" && -n "$APKSIGNER" && -f "$RUNNER_TEMP/repo2apk-signing/release.keystore" ]]; then
-            "$APKSIGNER" sign               --ks "$RUNNER_TEMP/repo2apk-signing/release.keystore"               --ks-key-alias "$REPO2APK_KEY_ALIAS"               --ks-pass "pass:$REPO2APK_STORE_PASSWORD"               --key-pass "pass:$REPO2APK_KEY_PASSWORD"               "$TARGET_APK"
+            "$APKSIGNER" sign \
+              --ks "$RUNNER_TEMP/repo2apk-signing/release.keystore" \
+              --ks-key-alias "$REPO2APK_KEY_ALIAS" \
+              --ks-pass "pass:$REPO2APK_STORE_PASSWORD" \
+              --key-pass "pass:$REPO2APK_KEY_PASSWORD" \
+              "$TARGET_APK"
             SIGNING_STATUS="signed"
             IS_SIGNED="true"
           elif [[ -n "$APKSIGNER" ]] && "$APKSIGNER" verify "$TARGET_APK" >/dev/null 2>&1; then
@@ -298,7 +432,17 @@ jobs:
             APP_NAME="$(printf '%s\n' "$BADGING" | sed -n "s/.*application-label:'\([^']*\)'.*/\1/p" | head -n 1)"
           fi
 
-          jq -n             --arg fileName "$APK_FILE"             --arg appName "$APP_NAME"             --arg packageId "$PKG_ID"             --arg versionName "$V_NAME"             --arg versionCode "$V_CODE"             --arg sha256 "$SHA256"             --argjson isSigned "$IS_SIGNED"             --arg signingStatus "$SIGNING_STATUS"             --arg abi "${{ inputs.abi_mode }}"             '{fileName: $fileName, appName: $appName, packageId: $packageId, versionName: $versionName, versionCode: $versionCode, sha256: $sha256, isSigned: $isSigned, signingStatus: $signingStatus, abi: $abi}' > "$OUT_DIR/repo2apk-metadata.json"
+          jq -n \
+            --arg fileName "$APK_FILE" \
+            --arg appName "$APP_NAME" \
+            --arg packageId "$PKG_ID" \
+            --arg versionName "$V_NAME" \
+            --arg versionCode "$V_CODE" \
+            --arg sha256 "$SHA256" \
+            --argjson isSigned "$IS_SIGNED" \
+            --arg signingStatus "$SIGNING_STATUS" \
+            --arg abi "${{ inputs.abi_mode }}" \
+            '{fileName: $fileName, appName: $appName, packageId: $packageId, versionName: $versionName, versionCode: $versionCode, sha256: $sha256, isSigned: $isSigned, signingStatus: $signingStatus, abi: $abi}' > "$OUT_DIR/repo2apk-metadata.json"
 
           echo "Validated APK: $APK_FILE (SHA-256: $SHA256, signing: $SIGNING_STATUS)"
 
