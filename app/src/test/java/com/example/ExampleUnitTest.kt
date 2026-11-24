@@ -707,7 +707,7 @@ class ExampleUnitTest {
     @Test
     fun `focus peaking edge response and display coordinate mapping respect thresholds and orientation`() {
         val flatResp = YuvUtils.computeFocusEdgeResponse(120, 120, 120, 120, 120)
-        val softEdgeResp = YuvUtils.computeFocusEdgeResponse(120, 95, 145, 120, 120) // sobel = 50
+        val softEdgeResp = YuvUtils.computeFocusEdgeResponse(120, 108, 132, 120, 120) // sobel = 24
         val crispEdgeResp = YuvUtils.computeFocusEdgeResponse(200, 100, 100, 100, 100) // lap = 400 -> 300
 
         assertEquals(0, flatResp)
@@ -831,5 +831,112 @@ class ExampleUnitTest {
         assertTrue(ar.aiAutoAdjustLabel.isNotBlank() && en.aiAutoAdjustLabel.isNotBlank())
         assertTrue(ar.aiAutoAdjustDesc.isNotBlank() && en.aiAutoAdjustDesc.isNotBlank())
         assertTrue(ar.aiAutoPresetActiveBadge.isNotBlank() && en.aiAutoPresetActiveBadge.isNotBlank())
+    }
+
+    @Test
+    fun `video pts time scale computes normal slow-mo and time-lapse accurately`() {
+        assertEquals(1.0, com.example.video.VideoRecordingEngine.computePtsTimeScale(1, 1), 1e-6)
+        assertEquals(4.0, com.example.video.VideoRecordingEngine.computePtsTimeScale(4, 1), 1e-6)
+        assertEquals(0.1, com.example.video.VideoRecordingEngine.computePtsTimeScale(1, 10), 1e-6)
+        // Slow-motion takes priority over time-lapse if both exceed 1
+        assertEquals(4.0, com.example.video.VideoRecordingEngine.computePtsTimeScale(4, 10), 1e-6)
+    }
+
+    @Test
+    fun `configurable 3x3 grid lines and power points compute exact composition geometry`() {
+        val baseLines = com.example.camera.compute3x3GridLines(900f, 1200f, includeDiagonals = false)
+        assertEquals(4, baseLines.size)
+        // Vertical 1/3 and 2/3
+        assertEquals(300f, baseLines[0].first.first, 0.01f)
+        assertEquals(600f, baseLines[1].first.first, 0.01f)
+        // Horizontal 1/3 and 2/3
+        assertEquals(400f, baseLines[2].first.second, 0.01f)
+        assertEquals(800f, baseLines[3].first.second, 0.01f)
+
+        val withDiagonals = com.example.camera.compute3x3GridLines(900f, 1200f, includeDiagonals = true)
+        assertEquals(6, withDiagonals.size)
+
+        val dots = com.example.camera.compute3x3IntersectionPoints(900f, 1200f)
+        assertEquals(4, dots.size)
+        assertEquals(300f to 400f, dots[0])
+        assertEquals(600f to 800f, dots[3])
+
+        val cfg = com.example.camera.GridOverlayConfig(
+            type = com.example.camera.GridOverlayType.RULE_OF_THIRDS,
+            opacity = 0.75f,
+            thickness = com.example.camera.GridLineThickness.BOLD,
+            color = com.example.camera.GridLineColor.AMBER,
+            showDiagonals = true,
+            showIntersectionDots = true
+        )
+        assertEquals(3.2f, cfg.thickness.strokePx, 0.01f)
+        assertTrue(cfg.showDiagonals && cfg.showIntersectionDots)
+    }
+
+    @Test
+    fun `iso priority shutter and night exposure helpers balance low light within hardware bounds`() {
+        // Raising ISO from 400 -> 1600 at 0 EV reduces shutter from 40ms to 10ms
+        val isoPriority = com.example.camera.computeIsoPriorityShutterNs(
+            targetIso = 1600,
+            liveIso = 400,
+            liveExposureNs = 40_000_000L,
+            evSteps = 0,
+            evStepSize = 0.1f,
+            exposureRange = 100_000L..500_000_000L
+        )
+        assertEquals(10_000_000L, isoPriority)
+
+        // +1.0 EV bias (10 steps of 0.1 EV) doubles exposure within handheld cap
+        val boostedIsoPriority = com.example.camera.computeIsoPriorityShutterNs(
+            targetIso = 1600,
+            liveIso = 400,
+            liveExposureNs = 40_000_000L,
+            evSteps = 10,
+            evStepSize = 0.1f,
+            exposureRange = 100_000L..500_000_000L
+        )
+        assertEquals(20_000_000L, boostedIsoPriority)
+
+        // Night frame exposure honors targetMaxIso ceiling (800 vs 3200) and positive EV bias
+        val (cleanExp, cleanIso) = com.example.camera.PhotoCaptureEngine.computeNightFrameExposure(
+            baseExposureNs = 30_000_000L,
+            baseIso = 1200,
+            astroMode = false,
+            exposureRange = 100_000L..400_000_000L,
+            isoRange = 100..3200,
+            targetMaxIso = 800,
+            evBiasSteps = 3,
+            aeCompensationStep = 0.1f
+        )
+        assertTrue(cleanExp in 75_000_000L..135_000_000L)
+        assertEquals(800, cleanIso)
+
+        val (_, brightIso) = com.example.camera.PhotoCaptureEngine.computeNightFrameExposure(
+            baseExposureNs = 30_000_000L,
+            baseIso = 1600,
+            astroMode = false,
+            exposureRange = 100_000L..400_000_000L,
+            isoRange = 100..3200,
+            targetMaxIso = 3200,
+            evBiasSteps = 6,
+            aeCompensationStep = 0.1f
+        )
+        assertTrue(brightIso > 1600 && brightIso <= 3200)
+
+        val ar = LocaleStrings.forLanguage(AppLanguage.ARABIC)
+        val en = LocaleStrings.forLanguage(AppLanguage.ENGLISH)
+        assertTrue(ar.grid3x3QuickLabel.isNotBlank() && en.grid3x3QuickLabel.isNotBlank())
+        assertTrue(ar.gridOpacityLabel.isNotBlank() && en.gridOpacityLabel.isNotBlank())
+        assertTrue(ar.gridThicknessLabel.isNotBlank() && en.gridThicknessLabel.isNotBlank())
+        assertTrue(ar.gridColorLabel.isNotBlank() && en.gridColorLabel.isNotBlank())
+        assertTrue(ar.gridDiagonalsLabel.isNotBlank() && en.gridDiagonalsLabel.isNotBlank())
+        assertTrue(ar.gridIntersectionDotsLabel.isNotBlank() && en.gridIntersectionDotsLabel.isNotBlank())
+        assertTrue(ar.exposureIsoTitle.isNotBlank() && en.exposureIsoTitle.isNotBlank())
+        assertTrue(ar.lowLightMaxIsoLabel.isNotBlank() && en.lowLightMaxIsoLabel.isNotBlank())
+        assertTrue(ar.lowLightEvBiasLabel.isNotBlank() && en.lowLightEvBiasLabel.isNotBlank())
+        assertTrue(ar.isoAutoShutterLabel.isNotBlank() && en.isoAutoShutterLabel.isNotBlank())
+        assertTrue(ar.shutterLockedLabel.isNotBlank() && en.shutterLockedLabel.isNotBlank())
+        assertTrue(ar.manualIsoUnavailableHint.isNotBlank() && en.manualIsoUnavailableHint.isNotBlank())
+        assertTrue(ar.resetAutoLabel.isNotBlank() && en.resetAutoLabel.isNotBlank())
     }
 }

@@ -12,8 +12,12 @@ import androidx.datastore.preferences.preferencesDataStore
 import com.example.camera.AntiBandingOption
 import com.example.camera.FocusPeakingColor
 import com.example.camera.FocusPeakingSensitivity
+import com.example.camera.GridLineColor
+import com.example.camera.GridLineThickness
 import com.example.camera.GridOverlayType
+import com.example.camera.ProcessingDetailPreset
 import com.example.camera.WatermarkStyle
+import androidx.datastore.preferences.core.floatPreferencesKey
 import com.example.processing.CameraColorProfile
 import com.example.processing.LibPatcherConfig
 import kotlinx.coroutines.flow.Flow
@@ -34,6 +38,12 @@ data class UltraCamSettings(
     val customSafTreeUri: String? = null,
     val filenamePrefix: String = "UCAM",
     val gridOverlay: GridOverlayType = GridOverlayType.RULE_OF_THIRDS,
+    val lastActiveGridOverlay: GridOverlayType = GridOverlayType.RULE_OF_THIRDS,
+    val gridOpacity: Float = 0.50f,
+    val gridThickness: GridLineThickness = GridLineThickness.MEDIUM,
+    val gridColor: GridLineColor = GridLineColor.WHITE,
+    val gridShowDiagonals: Boolean = false,
+    val gridShowIntersectionDots: Boolean = false,
     val showHistogram: Boolean = true,
     val showRgbHistogram: Boolean = true,
     val showDigitalLevel: Boolean = true,
@@ -46,6 +56,14 @@ data class UltraCamSettings(
     val focusPowerMode: Boolean = false,
     val showLiveColorBar: Boolean = true,
     val aiAutoAdjustEnabled: Boolean = true,
+    val mirrorFrontCamera: Boolean = true,
+    val hapticShutterFeedback: Boolean = true,
+    val hdrFrameCount: Int = 3,
+    val hdrGhostRejection: Boolean = true,
+    val lowLightAiBoost: Boolean = true,
+    val lowLightTargetMaxIso: Int = 1600,
+    val lowLightEvBiasSteps: Int = 1,
+    val processingDetailPreset: ProcessingDetailPreset = ProcessingDetailPreset.BALANCED,
     val libPatcher: LibPatcherConfig = LibPatcherConfig(),
     val activePresetSlot: Int = 0, // 0 = Custom/Active, 1 = C1, 2 = C2, 3 = C3
     val hasPresetC1: Boolean = false,
@@ -67,6 +85,12 @@ class SettingsManager(private val context: Context) {
         val SAF_TREE_URI = stringPreferencesKey("saf_tree_uri")
         val FILENAME_PREFIX = stringPreferencesKey("filename_prefix")
         val GRID_OVERLAY = stringPreferencesKey("grid_overlay")
+        val LAST_ACTIVE_GRID = stringPreferencesKey("last_active_grid")
+        val GRID_OPACITY = floatPreferencesKey("grid_opacity")
+        val GRID_THICKNESS = stringPreferencesKey("grid_thickness")
+        val GRID_COLOR = stringPreferencesKey("grid_color")
+        val GRID_SHOW_DIAGONALS = booleanPreferencesKey("grid_show_diagonals")
+        val GRID_SHOW_DOTS = booleanPreferencesKey("grid_show_dots")
         val SHOW_HISTOGRAM = booleanPreferencesKey("show_histogram")
         val SHOW_RGB_HISTOGRAM = booleanPreferencesKey("show_rgb_histogram")
         val SHOW_LEVEL = booleanPreferencesKey("show_level")
@@ -79,6 +103,14 @@ class SettingsManager(private val context: Context) {
         val FOCUS_POWER_MODE = booleanPreferencesKey("focus_power_mode")
         val SHOW_LIVE_COLOR_BAR = booleanPreferencesKey("show_live_color_bar")
         val AI_AUTO_ADJUST = booleanPreferencesKey("ai_auto_adjust")
+        val MIRROR_FRONT_CAMERA = booleanPreferencesKey("mirror_front_camera")
+        val HAPTIC_SHUTTER = booleanPreferencesKey("haptic_shutter")
+        val HDR_FRAME_COUNT = intPreferencesKey("hdr_frame_count")
+        val HDR_GHOST_REJECTION = booleanPreferencesKey("hdr_ghost_rejection")
+        val LOW_LIGHT_AI_BOOST = booleanPreferencesKey("low_light_ai_boost")
+        val LOW_LIGHT_MAX_ISO = intPreferencesKey("low_light_max_iso")
+        val LOW_LIGHT_EV_BIAS = intPreferencesKey("low_light_ev_bias")
+        val DETAIL_PRESET = stringPreferencesKey("processing_detail_preset")
         val LIB_PATCHER_JSON = stringPreferencesKey("lib_patcher_json")
         val ACTIVE_PRESET_SLOT = intPreferencesKey("active_preset_slot")
         val PRESET_C1_JSON = stringPreferencesKey("preset_c1_json")
@@ -87,6 +119,14 @@ class SettingsManager(private val context: Context) {
     }
 
     val settingsFlow: Flow<UltraCamSettings> = context.ultraCamDataStore.data.map { prefs ->
+        val grid = prefs[Keys.GRID_OVERLAY]?.let { name ->
+            runCatching { GridOverlayType.valueOf(name) }.getOrNull()
+        } ?: GridOverlayType.RULE_OF_THIRDS
+        val lastGrid = prefs[Keys.LAST_ACTIVE_GRID]?.let { name ->
+            runCatching { GridOverlayType.valueOf(name) }.getOrNull()
+        }?.takeIf { it != GridOverlayType.NONE }
+            ?: if (grid != GridOverlayType.NONE) grid else GridOverlayType.RULE_OF_THIRDS
+
         UltraCamSettings(
             language = prefs[Keys.LANGUAGE]?.let { code ->
                 AppLanguage.entries.firstOrNull { it.code == code }
@@ -104,9 +144,17 @@ class SettingsManager(private val context: Context) {
             gpsExifEnabled = prefs[Keys.GPS_EXIF_ENABLED] ?: false,
             customSafTreeUri = prefs[Keys.SAF_TREE_URI],
             filenamePrefix = (prefs[Keys.FILENAME_PREFIX] ?: "UCAM").ifBlank { "UCAM" },
-            gridOverlay = prefs[Keys.GRID_OVERLAY]?.let { name ->
-                runCatching { GridOverlayType.valueOf(name) }.getOrNull()
-            } ?: GridOverlayType.RULE_OF_THIRDS,
+            gridOverlay = grid,
+            lastActiveGridOverlay = lastGrid,
+            gridOpacity = (prefs[Keys.GRID_OPACITY] ?: 0.50f).coerceIn(0.20f, 0.95f),
+            gridThickness = prefs[Keys.GRID_THICKNESS]?.let { name ->
+                runCatching { GridLineThickness.valueOf(name) }.getOrNull()
+            } ?: GridLineThickness.MEDIUM,
+            gridColor = prefs[Keys.GRID_COLOR]?.let { name ->
+                runCatching { GridLineColor.valueOf(name) }.getOrNull()
+            } ?: GridLineColor.WHITE,
+            gridShowDiagonals = prefs[Keys.GRID_SHOW_DIAGONALS] ?: false,
+            gridShowIntersectionDots = prefs[Keys.GRID_SHOW_DOTS] ?: false,
             showHistogram = prefs[Keys.SHOW_HISTOGRAM] ?: true,
             showRgbHistogram = prefs[Keys.SHOW_RGB_HISTOGRAM] ?: true,
             showDigitalLevel = prefs[Keys.SHOW_LEVEL] ?: true,
@@ -123,6 +171,16 @@ class SettingsManager(private val context: Context) {
             focusPowerMode = prefs[Keys.FOCUS_POWER_MODE] ?: false,
             showLiveColorBar = prefs[Keys.SHOW_LIVE_COLOR_BAR] ?: true,
             aiAutoAdjustEnabled = prefs[Keys.AI_AUTO_ADJUST] ?: true,
+            mirrorFrontCamera = prefs[Keys.MIRROR_FRONT_CAMERA] ?: true,
+            hapticShutterFeedback = prefs[Keys.HAPTIC_SHUTTER] ?: true,
+            hdrFrameCount = if ((prefs[Keys.HDR_FRAME_COUNT] ?: 3) >= 5) 5 else 3,
+            hdrGhostRejection = prefs[Keys.HDR_GHOST_REJECTION] ?: true,
+            lowLightAiBoost = prefs[Keys.LOW_LIGHT_AI_BOOST] ?: true,
+            lowLightTargetMaxIso = (prefs[Keys.LOW_LIGHT_MAX_ISO] ?: 1600).coerceIn(400, 6400),
+            lowLightEvBiasSteps = (prefs[Keys.LOW_LIGHT_EV_BIAS] ?: 1).coerceIn(-6, 8),
+            processingDetailPreset = prefs[Keys.DETAIL_PRESET]?.let { name ->
+                runCatching { ProcessingDetailPreset.valueOf(name) }.getOrNull()
+            } ?: ProcessingDetailPreset.BALANCED,
             libPatcher = LibPatcherConfig.fromJsonString(prefs[Keys.LIB_PATCHER_JSON]),
             activePresetSlot = prefs[Keys.ACTIVE_PRESET_SLOT] ?: 0,
             hasPresetC1 = !prefs[Keys.PRESET_C1_JSON].isNullOrBlank(),
@@ -175,7 +233,47 @@ class SettingsManager(private val context: Context) {
     }
 
     suspend fun setGridOverlay(grid: GridOverlayType) {
-        context.ultraCamDataStore.edit { it[Keys.GRID_OVERLAY] = grid.name }
+        context.ultraCamDataStore.edit { prefs ->
+            prefs[Keys.GRID_OVERLAY] = grid.name
+            if (grid != GridOverlayType.NONE) {
+                prefs[Keys.LAST_ACTIVE_GRID] = grid.name
+            }
+        }
+    }
+
+    suspend fun toggleGridOverlayEnabled(enabled: Boolean) {
+        context.ultraCamDataStore.edit { prefs ->
+            if (enabled) {
+                val restored = prefs[Keys.LAST_ACTIVE_GRID]?.let {
+                    runCatching { GridOverlayType.valueOf(it) }.getOrNull()
+                }?.takeIf { it != GridOverlayType.NONE } ?: GridOverlayType.RULE_OF_THIRDS
+                prefs[Keys.GRID_OVERLAY] = restored.name
+            } else {
+                val cur = prefs[Keys.GRID_OVERLAY]?.let {
+                    runCatching { GridOverlayType.valueOf(it) }.getOrNull()
+                }
+                if (cur != null && cur != GridOverlayType.NONE) {
+                    prefs[Keys.LAST_ACTIVE_GRID] = cur.name
+                }
+                prefs[Keys.GRID_OVERLAY] = GridOverlayType.NONE.name
+            }
+        }
+    }
+
+    suspend fun setGridConfig(
+        opacity: Float? = null,
+        thickness: GridLineThickness? = null,
+        color: GridLineColor? = null,
+        showDiagonals: Boolean? = null,
+        showIntersectionDots: Boolean? = null
+    ) {
+        context.ultraCamDataStore.edit { prefs ->
+            opacity?.let { prefs[Keys.GRID_OPACITY] = it.coerceIn(0.20f, 0.95f) }
+            thickness?.let { prefs[Keys.GRID_THICKNESS] = it.name }
+            color?.let { prefs[Keys.GRID_COLOR] = it.name }
+            showDiagonals?.let { prefs[Keys.GRID_SHOW_DIAGONALS] = it }
+            showIntersectionDots?.let { prefs[Keys.GRID_SHOW_DOTS] = it }
+        }
     }
 
     suspend fun setOverlays(
@@ -222,6 +320,36 @@ class SettingsManager(private val context: Context) {
 
     suspend fun setAiAutoAdjustEnabled(enabled: Boolean) {
         context.ultraCamDataStore.edit { it[Keys.AI_AUTO_ADJUST] = enabled }
+    }
+
+    suspend fun setMirrorFrontCamera(enabled: Boolean) {
+        context.ultraCamDataStore.edit { it[Keys.MIRROR_FRONT_CAMERA] = enabled }
+    }
+
+    suspend fun setHapticShutterFeedback(enabled: Boolean) {
+        context.ultraCamDataStore.edit { it[Keys.HAPTIC_SHUTTER] = enabled }
+    }
+
+    suspend fun setHdrOptions(frameCount: Int? = null, ghostRejection: Boolean? = null) {
+        context.ultraCamDataStore.edit { prefs ->
+            frameCount?.let { prefs[Keys.HDR_FRAME_COUNT] = if (it >= 5) 5 else 3 }
+            ghostRejection?.let { prefs[Keys.HDR_GHOST_REJECTION] = it }
+        }
+    }
+
+    suspend fun setLowLightAiBoost(enabled: Boolean) {
+        context.ultraCamDataStore.edit { it[Keys.LOW_LIGHT_AI_BOOST] = enabled }
+    }
+
+    suspend fun setLowLightTuning(maxIso: Int? = null, evBiasSteps: Int? = null) {
+        context.ultraCamDataStore.edit { prefs ->
+            maxIso?.let { prefs[Keys.LOW_LIGHT_MAX_ISO] = it.coerceIn(400, 6400) }
+            evBiasSteps?.let { prefs[Keys.LOW_LIGHT_EV_BIAS] = it.coerceIn(-6, 8) }
+        }
+    }
+
+    suspend fun setProcessingDetailPreset(preset: ProcessingDetailPreset) {
+        context.ultraCamDataStore.edit { it[Keys.DETAIL_PRESET] = preset.name }
     }
 
     suspend fun updateLibPatcher(transform: (LibPatcherConfig) -> LibPatcherConfig) {

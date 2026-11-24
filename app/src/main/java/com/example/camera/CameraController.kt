@@ -30,6 +30,7 @@ import com.example.processing.SceneLabelObservation
 import com.example.processing.YuvUtils
 import com.example.system.StorageManager
 import com.example.system.ThermalMonitor
+import com.example.system.ThermalSeverity
 import com.example.system.UltraCamSettings
 import com.example.video.VideoRecordingConfig
 import com.example.video.VideoRecordingEngine
@@ -45,6 +46,7 @@ import kotlinx.coroutines.launch
 import kotlinx.coroutines.sync.Mutex
 import kotlinx.coroutines.sync.withLock
 import java.util.concurrent.ConcurrentLinkedQueue
+import java.util.concurrent.atomic.AtomicLong
 import kotlin.math.abs
 import kotlin.math.atan2
 import kotlin.math.roundToInt
@@ -111,6 +113,10 @@ class CameraController(
     private val _processingStage = MutableStateFlow<String?>(null)
     val processingStage: StateFlow<String?> = _processingStage.asStateFlow()
 
+    private val _processingJobs = MutableStateFlow<List<BackgroundProcessingJob>>(emptyList())
+    val processingJobs: StateFlow<List<BackgroundProcessingJob>> = _processingJobs.asStateFlow()
+    private val nextProcessingJobId = AtomicLong(1L)
+
     private val _burstProgress = MutableStateFlow<BurstCaptureProgress?>(null)
     val burstProgress: StateFlow<BurstCaptureProgress?> = _burstProgress.asStateFlow()
 
@@ -145,19 +151,24 @@ class CameraController(
     private var analysisYuvReader: ImageReader? = null
     private var stillJpegReader: ImageReader? = null
     private var stillRawReader: ImageReader? = null
-    private var compYuvReader: ImageReader? = null
 
     private val jpegQueue = ConcurrentLinkedQueue<Pair<Long, ByteArray>>()
     private val rawQueue = ConcurrentLinkedQueue<Image>()
-    private val compYuvQueue = ConcurrentLinkedQueue<Bitmap>()
     private val panoramaFrames = mutableListOf<Bitmap>()
 
     private var currentMode: AppDestination = AppDestination.CAMERA
     private var currentControls: ProControlsState = ProControlsState()
     private var currentSettings: UltraCamSettings = UltraCamSettings()
     private var currentToolMode: PhotoToolMode = PhotoToolMode.STANDARD
-    private var currentEisEnabled: Boolean = true
+    private var currentEisEnabled: Boolean = false
     private var currentVideoConfig: VideoRecordingConfig? = null
+    private var activeVideoSurface: Surface? = null
+    private var activeHighSpeedConfig: HighSpeedConfig? = null
+    private var selectedVideoSize: Size? = null
+    private var selectedVideoFps: Int? = null
+    private var activeMeteringRegions: Array<android.hardware.camera2.params.MeteringRectangle>? = null
+    private var tapAfHoldUntilMs: Long = 0L
+    private var tapAfResetJob: Job? = null
 
     private val mlKitClassifier = MlKitSceneClassifier()
 
@@ -302,6 +313,7 @@ class CameraController(
         } ?: return
 
         if (target.cameraId == _activeCamera.value?.cameraId) return
+        clearTapFocusState()
         _activeCamera.value = target
         openAndConfigureSession()
     }
@@ -309,8 +321,17 @@ class CameraController(
     suspend fun selectCameraById(cameraId: String) {
         val inv = _inventory.value ?: return
         val target = inv.cameras.firstOrNull { it.cameraId == cameraId && it.isUsableInApp } ?: return
+        clearTapFocusState()
         _activeCamera.value = target
         openAndConfigureSession()
+    }
+
+    private fun clearTapFocusState() {
+        tapAfResetJob?.cancel()
+        tapAfResetJob = null
+        activeMeteringRegions = null
+        tapAfHoldUntilMs = 0L
+        _focusPointNormalized.value = null
     }
 
     suspend fun reconfigureForState(
@@ -319,60 +340,96 @@ class CameraController(
         settings: UltraCamSettings,
         toolMode: PhotoToolMode,
         eisEnabled: Boolean,
+        selectedVideoSize: Size? = this.selectedVideoSize,
+        selectedVideoFps: Int? = this.selectedVideoFps,
         recreateSession: Boolean = false
     ) {
+        val isVideo = mode == AppDestination.VIDEO || mode == AppDestination.SLOW_MOTION
         val formatChanged = currentControls.captureFormat != controls.captureFormat ||
             currentControls.selectedResolution != controls.selectedResolution
-        val powerOrSuperChanged = currentSettings.focusPowerMode != settings.focusPowerMode ||
-            currentSettings.superResolutionEnabled != settings.superResolutionEnabled
-        val modeGroupChanged = (currentMode == AppDestination.SLOW_MOTION) != (mode == AppDestination.SLOW_MOTION) ||
-            (currentMode in listOf(AppDestination.HDR, AppDestination.NIGHT)) !=
-            (mode in listOf(AppDestination.HDR, AppDestination.NIGHT)) ||
-            (currentToolMode == PhotoToolMode.ASTRO) != (toolMode == PhotoToolMode.ASTRO)
+        val videoModeChanged = (currentMode == AppDestination.VIDEO || currentMode == AppDestination.SLOW_MOTION) != isVideo ||
+            (currentMode == AppDestination.SLOW_MOTION) != (mode == AppDestination.SLOW_MOTION)
+        val videoSizeChanged = isVideo && selectedVideoSize != null && this.selectedVideoSize != selectedVideoSize
+
+        if (controls.manualFocusEnabled && !currentControls.manualFocusEnabled) {
+            clearTapFocusState()
+        }
 
         currentMode = mode
         currentControls = controls
         currentSettings = settings
         currentToolMode = toolMode
         currentEisEnabled = eisEnabled
+        if (selectedVideoSize != null) this.selectedVideoSize = selectedVideoSize
+        if (selectedVideoFps != null) this.selectedVideoFps = selectedVideoFps
 
         if (!hasValidPreviewTexture()) return
 
-        if (recreateSession || formatChanged || modeGroupChanged || powerOrSuperChanged) {
+        if (videoEngine.uiState.value.isRecording || activeVideoSurface != null) {
+            updateRepeatingRequest(activeVideoSurface, activeHighSpeedConfig)
+        } else if (recreateSession || formatChanged || videoModeChanged || videoSizeChanged) {
             openAndConfigureSession()
         } else {
             updateRepeatingRequest()
         }
     }
 
-    suspend fun openAndConfigureSession(videoInputSurface: Surface? = null, highSpeedConfig: HighSpeedConfig? = null) {
-        sessionMutex.withLock {
-            val caps = _activeCamera.value ?: return
-            val tex = previewSurfaceTexture ?: return
+    suspend fun openAndConfigureSession(
+        videoInputSurface: Surface? = null,
+        highSpeedConfig: HighSpeedConfig? = null
+    ): Boolean {
+        return sessionMutex.withLock {
+            val caps = _activeCamera.value ?: return@withLock false
+            val tex = previewSurfaceTexture ?: return@withLock false
             if (!previewTextureValid || isTextureReleased(tex)) {
                 previewTextureValid = false
                 previewSurfaceTexture = null
-                return
+                return@withLock false
             }
+
+            activeVideoSurface = videoInputSurface
+            activeHighSpeedConfig = highSpeedConfig
 
             sessionManager.closeSessionOnly()
             closeReaders()
             val openRes = sessionManager.openCamera(caps.cameraId)
             if (openRes.isFailure) {
+                activeVideoSurface = null
+                activeHighSpeedConfig = null
                 _captureFeedback.value = CaptureFeedback(openRes.exceptionOrNull()?.message, isWarning = true)
-                return
+                return@withLock false
             }
 
             // Re-verify SurfaceTexture did not get abandoned while awaiting camera open
             if (!previewTextureValid || previewSurfaceTexture !== tex || isTextureReleased(tex)) {
-                return
+                activeVideoSurface = null
+                activeHighSpeedConfig = null
+                return@withLock false
             }
 
-            val isVideo = currentMode == AppDestination.VIDEO || currentMode == AppDestination.SLOW_MOTION
+            val isVideo = currentMode == AppDestination.VIDEO ||
+                currentMode == AppDestination.SLOW_MOTION ||
+                videoInputSurface != null
+            val targetVideoSize = currentVideoConfig?.size
+                ?: selectedVideoSize
+                ?: chooseBestPreviewSize(caps.videoSizes.ifEmpty { caps.yuvSizes }, 1920, 1080)
+            val targetJpegSize = currentControls.selectedResolution?.takeIf { caps.jpegSizes.contains(it) }
+                ?: caps.jpegSizes.firstOrNull()
+
             val desiredPreview = when {
                 highSpeedConfig != null -> highSpeedConfig.size
-                isVideo -> currentVideoConfig?.size ?: chooseBestPreviewSize(caps.videoSizes.ifEmpty { caps.yuvSizes }, 1920, 1080)
-                else -> chooseBestPreviewSize(caps.yuvSizes, 1440, 1080)
+                isVideo -> chooseBestPreviewSizeMatchingAspect(
+                    sizes = caps.yuvSizes.ifEmpty { caps.videoSizes },
+                    targetAspectSize = targetVideoSize,
+                    maxW = targetVideoSize.width.coerceAtLeast(1280),
+                    maxH = targetVideoSize.height.coerceAtLeast(720)
+                )
+                else -> chooseBestPreviewSizeMatchingAspect(
+                    sizes = caps.yuvSizes,
+                    targetAspectSize = targetJpegSize,
+                    maxW = 1440,
+                    maxH = 1080
+                )
             }
             _previewSize.value = desiredPreview
 
@@ -385,54 +442,52 @@ class CameraController(
             if (prevSurface == null || !prevSurface.isValid || !previewTextureValid || isTextureReleased(tex)) {
                 runCatching { prevSurface?.release() }
                 previewSurface = null
-                return
+                activeVideoSurface = null
+                activeHighSpeedConfig = null
+                return@withLock false
             }
             previewSurface = prevSurface
 
             val surfaces = mutableListOf(prevSurface)
             val handler = sessionManager.getHandler()
 
-        if (highSpeedConfig != null && videoInputSurface != null) {
-            surfaces.add(videoInputSurface)
-        } else {
-            // Lightweight analysis YUV stream (640x480) for zero-lag histograms, focus peaking, zebra, AI, QR
-            val analysisSize = chooseBestPreviewSize(caps.yuvSizes, 640, 480)
-            val analysisReader = ImageReader.newInstance(
-                analysisSize.width,
-                analysisSize.height,
-                ImageFormat.YUV_420_888,
-                2
-            ).apply {
-                setOnImageAvailableListener({ reader ->
-                    synchronized(readerLock) {
-                        if (analysisYuvReader !== reader) return@synchronized
-                        var img: Image? = null
-                        try {
-                            img = reader.acquireLatestImage() ?: return@synchronized
-                            processLiveAnalysisFrame(img, caps)
-                        } catch (_: IllegalStateException) {
-                            // Reader or Image closed concurrently during teardown
-                        } finally {
-                            runCatching { img?.close() }
-                        }
-                    }
-                }, handler)
-            }
-            analysisYuvReader = analysisReader
-            surfaces.add(analysisReader.surface)
-
             if (videoInputSurface != null) {
+                // Clean 2-stream session (Preview + MediaCodec Input Surface) guarantees compatibility across HALs
                 surfaces.add(videoInputSurface)
             } else {
-                // Still JPEG reader
-                val jpegSize = currentControls.selectedResolution?.takeIf { caps.jpegSizes.contains(it) }
-                    ?: caps.jpegSizes.firstOrNull()
-                    ?: Size(1920, 1080)
+                // Lightweight analysis YUV stream (640x480) for zero-lag histograms, focus peaking, zebra, AI, QR
+                val analysisSize = chooseBestPreviewSize(caps.yuvSizes, 640, 480)
+                val analysisReader = ImageReader.newInstance(
+                    analysisSize.width,
+                    analysisSize.height,
+                    ImageFormat.YUV_420_888,
+                    2
+                ).apply {
+                    setOnImageAvailableListener({ reader ->
+                        synchronized(readerLock) {
+                            if (analysisYuvReader !== reader) return@synchronized
+                            var img: Image? = null
+                            try {
+                                img = reader.acquireLatestImage() ?: return@synchronized
+                                processLiveAnalysisFrame(img, caps)
+                            } catch (_: IllegalStateException) {
+                                // Reader or Image closed concurrently during teardown
+                            } finally {
+                                runCatching { img?.close() }
+                            }
+                        }
+                    }, handler)
+                }
+                analysisYuvReader = analysisReader
+                surfaces.add(analysisReader.surface)
+
+                // Still JPEG reader (3-stream hardware ceiling: Preview + Analysis YUV + Still JPEG; maxImages=12 for HDR/Night/Burst headroom)
+                val jpegSize = targetJpegSize ?: Size(1920, 1080)
                 val jpegReader = ImageReader.newInstance(
                     jpegSize.width,
                     jpegSize.height,
                     ImageFormat.JPEG,
-                    if (caps.supportsBurstCapture) 10 else 6
+                    if (caps.supportsBurstCapture) 12 else 10
                 ).apply {
                     setOnImageAvailableListener({ reader ->
                         synchronized(readerLock) {
@@ -479,81 +534,46 @@ class CameraController(
                     stillRawReader = rReader
                     surfaces.add(rReader.surface)
                 }
-
-                // Computational YUV capture reader (full native YUV in Focus Turbo, bounded 2560x1920 in standard)
-                if (currentMode == AppDestination.HDR ||
-                    currentMode == AppDestination.NIGHT ||
-                    currentToolMode == PhotoToolMode.ASTRO ||
-                    currentSettings.superResolutionEnabled ||
-                    currentSettings.focusPowerMode
-                ) {
-                    val compSize = if (currentSettings.focusPowerMode) {
-                        chooseBestPreviewSize(caps.yuvSizes, 4096, 3072)
-                    } else {
-                        chooseBestPreviewSize(caps.yuvSizes, 2560, 1920)
-                    }
-                    val cReader = ImageReader.newInstance(
-                        compSize.width,
-                        compSize.height,
-                        ImageFormat.YUV_420_888,
-                        3
-                    ).apply {
-                        setOnImageAvailableListener({ reader ->
-                            synchronized(readerLock) {
-                                if (compYuvReader !== reader) return@synchronized
-                                var img: Image? = null
-                                try {
-                                    img = reader.acquireNextImage() ?: return@synchronized
-                                    val rot = photoEngine.computeJpegOrientation(caps, lastSensorRotationDeg)
-                                    val maxDim = if (currentSettings.focusPowerMode) 4096 else 2560
-                                    val bmp = YuvUtils.yuv420ToBitmap(img, rot, maxDim = maxDim)
-                                    compYuvQueue.offer(bmp)
-                                } catch (_: IllegalStateException) {
-                                } finally {
-                                    runCatching { img?.close() }
-                                }
-                            }
-                        }, handler)
-                    }
-                    compYuvReader = cReader
-                    surfaces.add(cReader.surface)
-                }
             }
-        }
 
             if (surfaces.any { !it.isValid } || !previewTextureValid || isTextureReleased(tex)) {
-                return
+                activeVideoSurface = null
+                activeHighSpeedConfig = null
+                return@withLock false
             }
 
             val sessionRes = sessionManager.createSession(surfaces, highSpeedMode = highSpeedConfig != null)
             if (sessionRes.isFailure) {
+                activeVideoSurface = null
+                activeHighSpeedConfig = null
                 _captureFeedback.value = CaptureFeedback(sessionRes.exceptionOrNull()?.message, isWarning = true)
-                return
+                return@withLock false
             }
             updateRepeatingRequest(videoInputSurface, highSpeedConfig)
+            true
         }
     }
 
     fun updateRepeatingRequest(
-        videoInputSurface: Surface? = null,
-        highSpeedConfig: HighSpeedConfig? = null
+        videoInputSurface: Surface? = activeVideoSurface,
+        highSpeedConfig: HighSpeedConfig? = activeHighSpeedConfig
     ) {
         val device = sessionManager.cameraDevice ?: return
         val caps = _activeCamera.value ?: return
         val prev = previewSurface ?: return
         if (!prev.isValid || !previewTextureValid || isTextureReleased(previewSurfaceTexture)) return
 
-        val template = when {
-            videoInputSurface != null -> CameraDevice.TEMPLATE_RECORD
-            currentMode == AppDestination.VIDEO || currentMode == AppDestination.SLOW_MOTION ->
-                CameraDevice.TEMPLATE_RECORD
-            else -> CameraDevice.TEMPLATE_PREVIEW
-        }
+        val isVideo = videoInputSurface != null ||
+            currentMode == AppDestination.VIDEO ||
+            currentMode == AppDestination.SLOW_MOTION
+        val template = if (isVideo) CameraDevice.TEMPLATE_RECORD else CameraDevice.TEMPLATE_PREVIEW
         val builder = device.createCaptureRequest(template)
         builder.addTarget(prev)
-        if (videoInputSurface != null) builder.addTarget(videoInputSurface)
-        if (highSpeedConfig == null) {
-            analysisYuvReader?.surface?.let { builder.addTarget(it) }
+        val validVideoSurface = videoInputSurface?.takeIf { it.isValid }
+        if (validVideoSurface != null) {
+            builder.addTarget(validVideoSurface)
+        } else if (highSpeedConfig == null) {
+            analysisYuvReader?.surface?.takeIf { it.isValid }?.let { builder.addTarget(it) }
         }
 
         val activeAi = if (currentSettings.aiAssistantEnabled || currentSettings.focusPowerMode) {
@@ -563,21 +583,29 @@ class CameraController(
             activeAi?.recommendedWb
         } else null
 
+        val holdTapAfAuto = !currentControls.manualFocusEnabled &&
+            (currentControls.afLocked || System.currentTimeMillis() < tapAfHoldUntilMs)
+
         manualController.applyToBuilder(
             builder = builder,
             caps = caps,
             controls = currentControls,
-            isVideoMode = template == CameraDevice.TEMPLATE_RECORD,
+            isVideoMode = isVideo,
             eisEnabled = currentEisEnabled,
             aiProfile = activeAi?.profile,
             focusPowerMode = currentSettings.focusPowerMode,
-            aiAutoWb = autoWb
+            aiAutoWb = autoWb,
+            meteringRegions = if (holdTapAfAuto || currentControls.afLocked) activeMeteringRegions else null,
+            holdTapAfAuto = holdTapAfAuto
         )
 
+        val targetFps = currentVideoConfig?.fps ?: if (isVideo) selectedVideoFps else null
         val fpsRange = highSpeedConfig?.let { Range(it.minFps, it.maxFps) }
-            ?: currentVideoConfig?.fps?.let { fps ->
-                caps.aeTargetFpsRanges.firstOrNull { it.last >= fps && it.first <= fps }
+            ?: targetFps?.let { fps ->
+                caps.aeTargetFpsRanges.firstOrNull { it.first == fps && it.last == fps }
                     ?.let { Range(it.first, it.last) }
+                    ?: caps.aeTargetFpsRanges.firstOrNull { it.last >= fps && it.first <= fps }
+                        ?.let { Range(it.first, it.last) }
                     ?: Range(fps, fps)
             }
 
@@ -695,7 +723,8 @@ class CameraController(
                 exposureRangeNs = caps.exposureTimeRangeNs,
                 aeCompRange = caps.aeCompensationRange,
                 fullPower = currentSettings.focusPowerMode,
-                mlKitLabels = freshLabels
+                mlKitLabels = freshLabels,
+                lowLightAiBoost = currentSettings.lowLightAiBoost
             )
             _aiRecommendation.value = nextRec
 
@@ -731,45 +760,79 @@ class CameraController(
         val session = sessionManager.captureSession ?: return
         val caps = _activeCamera.value ?: return
         val prev = previewSurface ?: return
+        if (!prev.isValid) return
 
         _focusPointNormalized.value = normX to normY
         val regions = manualController.computeMeteringRectangles(
             normX, normY, caps, currentControls.digitalZoomRatio
         ) ?: return
 
-        val builder = device.createCaptureRequest(CameraDevice.TEMPLATE_PREVIEW)
+        activeMeteringRegions = regions
+        tapAfHoldUntilMs = System.currentTimeMillis() + 5000L
+        tapAfResetJob?.cancel()
+
+        val isVideo = currentMode == AppDestination.VIDEO ||
+            currentMode == AppDestination.SLOW_MOTION ||
+            activeVideoSurface != null
+        val builder = device.createCaptureRequest(
+            if (isVideo) CameraDevice.TEMPLATE_RECORD else CameraDevice.TEMPLATE_PREVIEW
+        )
         builder.addTarget(prev)
-        analysisYuvReader?.surface?.let { builder.addTarget(it) }
+        activeVideoSurface?.takeIf { it.isValid }?.let { builder.addTarget(it) }
+        if (activeVideoSurface == null && activeHighSpeedConfig == null) {
+            analysisYuvReader?.surface?.takeIf { it.isValid }?.let { builder.addTarget(it) }
+        }
 
         val updatedControls = currentControls.copy(
             aeLocked = lockAeAf && caps.supportsAeLock,
-            afLocked = lockAeAf && caps.supportsManualFocus
+            afLocked = lockAeAf && caps.supportsManualFocus && !currentControls.manualFocusEnabled
         )
         currentControls = updatedControls
         manualController.applyToBuilder(
             builder = builder,
             caps = caps,
             controls = updatedControls,
-            isVideoMode = false,
+            isVideoMode = isVideo,
             eisEnabled = currentEisEnabled,
             aiProfile = if (currentSettings.aiAssistantEnabled) _aiRecommendation.value?.profile else null,
             focusPowerMode = currentSettings.focusPowerMode,
             aiAutoWb = if (currentSettings.aiAssistantEnabled && currentSettings.aiAutoAdjustEnabled) {
                 _aiRecommendation.value?.recommendedWb
-            } else null
+            } else null,
+            meteringRegions = regions,
+            holdTapAfAuto = !updatedControls.manualFocusEnabled
         )
 
         builder.set(CaptureRequest.CONTROL_AE_REGIONS, regions)
-        if (caps.supportsManualFocus && caps.afModes.contains(CameraMetadata.CONTROL_AF_MODE_AUTO)) {
+        if (!updatedControls.manualFocusEnabled &&
+            caps.supportsManualFocus &&
+            caps.afModes.contains(CameraMetadata.CONTROL_AF_MODE_AUTO)
+        ) {
             builder.set(CaptureRequest.CONTROL_AF_REGIONS, regions)
             builder.set(CaptureRequest.CONTROL_AF_MODE, CameraMetadata.CONTROL_AF_MODE_AUTO)
             builder.set(CaptureRequest.CONTROL_AF_TRIGGER, CameraMetadata.CONTROL_AF_TRIGGER_START)
         }
-        builder.set(CaptureRequest.CONTROL_AE_PRECAPTURE_TRIGGER, CameraMetadata.CONTROL_AE_PRECAPTURE_TRIGGER_START)
+        if (!isVideo && !updatedControls.manualExposureEnabled) {
+            builder.set(CaptureRequest.CONTROL_AE_PRECAPTURE_TRIGGER, CameraMetadata.CONTROL_AE_PRECAPTURE_TRIGGER_START)
+        }
 
         runCatching {
             session.capture(builder.build(), repeatingCallback, sessionManager.getHandler())
-            updateRepeatingRequest()
+            updateRepeatingRequest(activeVideoSurface, activeHighSpeedConfig)
+        }
+
+        if (!lockAeAf) {
+            tapAfResetJob = scopeRef?.launch {
+                delay(5000L)
+                if (!currentControls.afLocked && !currentControls.aeLocked) {
+                    activeMeteringRegions = null
+                    tapAfHoldUntilMs = 0L
+                    _focusPointNormalized.value = null
+                    if (!_isCapturing.value) {
+                        updateRepeatingRequest(activeVideoSurface, activeHighSpeedConfig)
+                    }
+                }
+            }
         }
     }
 
@@ -815,11 +878,11 @@ class CameraController(
 
         _isCapturing.value = true
         try {
-            val outcome = executeSingleCaptureFlow(caps)
-            handleCaptureOutcome(outcome, onCaptureSaved)
+            executeCaptureNonBlocking(caps, onCaptureSaved)
         } finally {
             _isCapturing.value = false
             _processingStage.value = null
+            updateRepeatingRequest()
         }
     }
 
@@ -831,8 +894,7 @@ class CameraController(
                 if (!isActive) break
                 _intervalProgress.value = i to count
                 _isCapturing.value = true
-                val outcome = executeSingleCaptureFlow(caps)
-                handleCaptureOutcome(outcome, onCaptureSaved)
+                executeCaptureNonBlocking(caps, onCaptureSaved)
                 _isCapturing.value = false
                 if (i < count) delay(intervalSec * 1000L)
             }
@@ -965,7 +1027,45 @@ class CameraController(
         }
     }
 
-    private suspend fun executeSingleCaptureFlow(caps: CameraDeviceCapabilities): PhotoCaptureOutcome {
+    private fun enqueueBackgroundProcessing(
+        modeTag: String,
+        initialStage: BackgroundProcessingStage,
+        previewThumb: Bitmap?,
+        onCaptureSaved: () -> Unit,
+        processBlock: suspend (updateStage: (BackgroundProcessingStage, Float) -> Unit) -> PhotoCaptureOutcome
+    ) {
+        val jobId = nextProcessingJobId.getAndIncrement()
+        val job = BackgroundProcessingJob(
+            id = jobId,
+            modeTag = modeTag,
+            stage = initialStage,
+            progress = 0.18f,
+            previewBitmap = previewThumb
+        )
+        _processingJobs.value = _processingJobs.value + job
+
+        val launcherScope = scopeRef ?: kotlinx.coroutines.CoroutineScope(Dispatchers.Default)
+        launcherScope.launch(Dispatchers.Default) {
+            try {
+                val outcome = processBlock { stage, prog ->
+                    _processingJobs.value = _processingJobs.value.map { cur ->
+                        if (cur.id == jobId) cur.copy(stage = stage, progress = prog.coerceIn(0.05f, 0.99f))
+                        else cur
+                    }
+                }
+                handleCaptureOutcome(outcome, onCaptureSaved)
+            } catch (t: Throwable) {
+                _captureFeedback.value = CaptureFeedback(t.message ?: "Processing error", isWarning = true)
+            } finally {
+                _processingJobs.value = _processingJobs.value.filterNot { it.id == jobId }
+            }
+        }
+    }
+
+    private suspend fun executeCaptureNonBlocking(
+        caps: CameraDeviceCapabilities,
+        onCaptureSaved: () -> Unit
+    ) {
         val location = if (currentSettings.gpsExifEnabled) storageManager.getLastKnownCoarseLocation() else null
         val turbo = currentSettings.focusPowerMode
         val health = thermalMonitor.sampleNow(currentSettings.thermalProtectionEnabled, turbo)
@@ -991,12 +1091,13 @@ class CameraController(
                 0,
                 span.coerceAtMost(caps.aeCompensationRange.last)
             )
-            val savedAll = mutableListOf<com.example.system.SavedMediaResult>()
+            val acquiredList = mutableListOf<AcquiredSingleJpeg>()
             for ((idx, ev) in offsets.withIndex()) {
-                val res = photoEngine.captureSingleJpeg(
+                photoEngine.acquireSingleJpeg(
                     caps = caps,
                     controls = currentControls.copy(exposureCompensationSteps = ev),
                     jpegReader = jReader,
+                    previewSurface = previewSurface,
                     jpegQueue = jpegQueue,
                     deviceRotationDeg = lastSensorRotationDeg,
                     settings = currentSettings,
@@ -1009,10 +1110,24 @@ class CameraController(
                     aiSceneName = aiSceneName,
                     tapMetered = tapMetered,
                     aiAutoWb = autoWb
-                )
-                savedAll.addAll(res.savedResults)
+                ).onSuccess { acquiredList.add(it) }
             }
-            return PhotoCaptureOutcome(savedAll, detailInfo = "AEB 3 frames saved")
+            if (acquiredList.isEmpty()) {
+                _captureFeedback.value = CaptureFeedback("AEB capture failed", isWarning = true)
+                return
+            }
+            val thumb = acquiredList.firstOrNull()?.previewThumb
+            acquiredList.drop(1).forEach { it.previewThumb?.let { b -> if (!b.isRecycled) b.recycle() } }
+            enqueueBackgroundProcessing("AEB", BackgroundProcessingStage.ENHANCING, thumb, onCaptureSaved) { update ->
+                val savedAll = mutableListOf<com.example.system.SavedMediaResult>()
+                acquiredList.forEachIndexed { idx, acq ->
+                    update(BackgroundProcessingStage.ENHANCING, (idx + 0.5f) / acquiredList.size.toFloat())
+                    val outcome = photoEngine.processAcquiredSingleJpeg(acq)
+                    savedAll.addAll(outcome.savedResults)
+                }
+                PhotoCaptureOutcome(savedAll, detailInfo = "AEB ${savedAll.size} frames saved")
+            }
+            return
         }
 
         // 2. High-Speed Camera2 Continuous Burst (Pro Burst Drive OR Camera Burst Tool)
@@ -1025,8 +1140,8 @@ class CameraController(
                 val maxBurst = if (turbo) 10 else 6
                 health.recommendedMaxBurstFrames.coerceIn(3, maxBurst)
             }
-            return try {
-                photoEngine.captureHighSpeedBurst(
+            try {
+                val outcome = photoEngine.captureHighSpeedBurst(
                     caps = caps,
                     controls = currentControls,
                     jpegReader = jReader,
@@ -1045,9 +1160,11 @@ class CameraController(
                     aiAutoWb = autoWb,
                     onProgress = { prog -> _burstProgress.value = prog }
                 )
+                handleCaptureOutcome(outcome, onCaptureSaved)
             } finally {
                 _burstProgress.value = null
             }
+            return
         }
 
         // 3. RAW or RAW+JPEG in Pro mode
@@ -1056,7 +1173,7 @@ class CameraController(
                 currentControls.captureFormat == CaptureFormat.RAW_PLUS_JPEG) &&
             stillRawReader != null
         ) {
-            return photoEngine.captureRawOrDual(
+            val outcome = photoEngine.captureRawOrDual(
                 caps = caps,
                 controls = currentControls,
                 jpegReader = stillJpegReader,
@@ -1071,33 +1188,44 @@ class CameraController(
                 focusPowerMode = turbo,
                 tapMetered = tapMetered
             )
+            handleCaptureOutcome(outcome, onCaptureSaved)
+            return
+        }
+
+        val jReader = stillJpegReader
+        if (jReader == null) {
+            _captureFeedback.value = CaptureFeedback("JPEG surface unavailable", isWarning = true)
+            return
         }
 
         // 4. Computational Multi-frame (HDR / Night / Astro / Super Resolution / Focus Turbo 100%)
         val isAstro = currentMode == AppDestination.CAMERA && currentToolMode == PhotoToolMode.ASTRO
-        val effectiveSuperRes = (currentSettings.superResolutionEnabled || turbo) && health.allowSuperResolution && !isAstro
-        val useCompYuv = compYuvReader != null && previewSurface != null &&
-            (currentMode == AppDestination.HDR ||
-                currentMode == AppDestination.NIGHT ||
-                isAstro ||
-                (currentMode == AppDestination.CAMERA &&
-                    currentToolMode == PhotoToolMode.STANDARD &&
-                    effectiveSuperRes))
+        val effectiveSuperRes = (currentSettings.superResolutionEnabled || turbo) &&
+            !health.isLowMemory &&
+            health.thermalSeverity.ordinal < ThermalSeverity.SEVERE.ordinal &&
+            !isAstro
+        val useCompMultiFrame = (currentMode == AppDestination.HDR ||
+            currentMode == AppDestination.NIGHT ||
+            isAstro ||
+            (currentMode == AppDestination.CAMERA &&
+                currentToolMode == PhotoToolMode.STANDARD &&
+                effectiveSuperRes))
 
-        if (useCompYuv) {
+        if (useCompMultiFrame) {
             val frameCount = when {
-                isAstro -> (health.recommendedNightFrames + 2).coerceIn(8, 12)
-                currentMode == AppDestination.HDR -> health.recommendedHdrFrames
-                currentMode == AppDestination.NIGHT -> health.recommendedNightFrames
+                isAstro -> (health.recommendedNightFrames + 2).coerceIn(7, 10)
+                currentMode == AppDestination.HDR -> if (currentSettings.hdrFrameCount >= 5) 5 else health.recommendedHdrFrames.coerceIn(3, 5)
+                currentMode == AppDestination.NIGHT -> health.recommendedNightFrames.coerceIn(5, 8)
                 else -> if (turbo) health.recommendedMaxBurstFrames.coerceIn(5, 6)
                 else health.recommendedMaxBurstFrames.coerceIn(3, 5)
             }
-            return photoEngine.captureMultiFrameComputational(
+            val acquired = photoEngine.acquireMultiFrameJpegBurst(
                 caps = caps,
                 controls = currentControls,
-                yuvCaptureSurface = compYuvReader!!.surface,
-                previewSurface = previewSurface!!,
-                yuvFrameQueue = compYuvQueue,
+                jpegReader = jReader,
+                previewSurface = previewSurface,
+                jpegQueue = jpegQueue,
+                deviceRotationDeg = lastSensorRotationDeg,
                 frameCount = frameCount,
                 mode = currentMode,
                 superResEnabled = effectiveSuperRes,
@@ -1111,21 +1239,37 @@ class CameraController(
                 aiSceneName = aiSceneName,
                 tapMetered = tapMetered,
                 aiAutoWb = autoWb,
-                onStageUpdate = { stage -> _processingStage.value = stage }
-            )
+                liveExposureNs = _telemetry.value.exposureTimeNs,
+                liveIso = _telemetry.value.iso
+            ).getOrElse { err ->
+                _captureFeedback.value = CaptureFeedback(err.message ?: "Capture failed", isWarning = true)
+                return
+            }
+
+            val modeTag = when {
+                isAstro -> "ASTRO"
+                currentMode == AppDestination.HDR -> "HDR"
+                currentMode == AppDestination.NIGHT -> "NIGHT"
+                effectiveSuperRes -> "SR"
+                else -> "PHOTO"
+            }
+            enqueueBackgroundProcessing(modeTag, acquired.initialStage, acquired.previewThumb, onCaptureSaved) { update ->
+                photoEngine.processAcquiredMultiFrameBurst(acquired, onStageUpdate = update)
+            }
+            return
         }
 
-        // 5. Standard / Portrait / Document / Pro Single JPEG Capture
-        val jReader = stillJpegReader ?: return PhotoCaptureOutcome(emptyList(), "JPEG surface unavailable")
+        // 5. Standard / Portrait / Document / Pro Single JPEG Capture (non-blocking Phase 2!)
         val tag = when (currentToolMode) {
             PhotoToolMode.PORTRAIT -> "PORTRAIT"
             PhotoToolMode.DOCUMENT -> "DOC"
             else -> if (currentMode == AppDestination.PRO) "PRO" else "PHOTO"
         }
-        return photoEngine.captureSingleJpeg(
+        val acquired = photoEngine.acquireSingleJpeg(
             caps = caps,
             controls = currentControls,
             jpegReader = jReader,
+            previewSurface = previewSurface,
             jpegQueue = jpegQueue,
             deviceRotationDeg = lastSensorRotationDeg,
             settings = currentSettings,
@@ -1141,7 +1285,13 @@ class CameraController(
             aiSceneName = aiSceneName,
             tapMetered = tapMetered,
             aiAutoWb = autoWb
-        )
+        ).getOrElse { err ->
+            _captureFeedback.value = CaptureFeedback(err.message ?: "Capture failed", isWarning = true)
+            return
+        }
+        enqueueBackgroundProcessing(tag, acquired.initialStage, acquired.previewThumb, onCaptureSaved) { update ->
+            photoEngine.processAcquiredSingleJpeg(acquired, onStageUpdate = update)
+        }
     }
 
     private fun handleCaptureOutcome(outcome: PhotoCaptureOutcome, onCaptureSaved: () -> Unit) {
@@ -1164,32 +1314,52 @@ class CameraController(
             _captureFeedback.value = CaptureFeedback("Low storage (<150MB)", isWarning = true)
             return false
         }
-        currentVideoConfig = config
+        val caps = _activeCamera.value
+        val orientHint = if (caps != null) {
+            photoEngine.computeJpegOrientation(caps, lastSensorRotationDeg)
+        } else 90
+        val orientedConfig = config.copy(orientationHint = orientHint)
+        currentVideoConfig = orientedConfig
         val tag = when {
-            config.slowMotionFactor > 1 -> "SLOMO"
-            config.timeLapseSpeedFactor > 1 -> "TLAPSE"
+            orientedConfig.slowMotionFactor > 1 -> "SLOMO"
+            orientedConfig.timeLapseSpeedFactor > 1 -> "TLAPSE"
             else -> "VID"
         }
         val filename = storageManager.buildUniqueFilename(currentSettings.filenamePrefix, tag, "mp4")
         val tempFile = storageManager.createTempVideoFile(filename)
-        val prep = videoEngine.prepare(config, tempFile, filename)
+        val prep = videoEngine.prepare(orientedConfig, tempFile, filename)
         if (prep.isFailure) {
+            currentVideoConfig = null
             _captureFeedback.value = CaptureFeedback(prep.exceptionOrNull()?.message, isWarning = true)
             return false
         }
         val recSurface = prep.getOrThrow()
-        openAndConfigureSession(videoInputSurface = recSurface, highSpeedConfig = highSpeedConfig)
-        val scope = scopeRef ?: return false
+        val sessionOk = openAndConfigureSession(videoInputSurface = recSurface, highSpeedConfig = highSpeedConfig)
+        val scope = scopeRef
+        if (!sessionOk || scope == null) {
+            videoEngine.releaseInternal()
+            activeVideoSurface = null
+            activeHighSpeedConfig = null
+            currentVideoConfig = null
+            openAndConfigureSession(videoInputSurface = null, highSpeedConfig = null)
+            _captureFeedback.value = CaptureFeedback("Video session configuration failed", isWarning = true)
+            return false
+        }
         videoEngine.start(scope)
         return true
     }
 
     suspend fun stopVideoRecording(onCaptureSaved: () -> Unit) {
         val saved = videoEngine.stopAndPublish(currentSettings)
+        activeVideoSurface = null
+        activeHighSpeedConfig = null
+        currentVideoConfig = null
         openAndConfigureSession(videoInputSurface = null, highSpeedConfig = null)
         if (saved != null) {
             _captureFeedback.value = CaptureFeedback(saved.displayName, isWarning = false, savedUri = saved.uri)
             onCaptureSaved()
+        } else {
+            _captureFeedback.value = CaptureFeedback("Recording could not be saved", isWarning = true)
         }
     }
 
@@ -1198,6 +1368,26 @@ class CameraController(
         return bounded.maxByOrNull { it.width.toLong() * it.height.toLong() }
             ?: sizes.lastOrNull()
             ?: Size(1280, 720)
+    }
+
+    private fun chooseBestPreviewSizeMatchingAspect(
+        sizes: List<Size>,
+        targetAspectSize: Size?,
+        maxW: Int,
+        maxH: Int
+    ): Size {
+        if (sizes.isEmpty()) return Size(1280, 720)
+        if (targetAspectSize == null || targetAspectSize.height <= 0 || targetAspectSize.width <= 0) {
+            return chooseBestPreviewSize(sizes, maxW, maxH)
+        }
+        val targetRatio = maxOf(targetAspectSize.width, targetAspectSize.height).toFloat() /
+            minOf(targetAspectSize.width, targetAspectSize.height).toFloat()
+        val aspectMatched = sizes.filter { sz ->
+            val r = maxOf(sz.width, sz.height).toFloat() / minOf(sz.width, sz.height).coerceAtLeast(1).toFloat()
+            abs(r - targetRatio) < 0.04f
+        }
+        val pool = aspectMatched.ifEmpty { sizes }
+        return chooseBestPreviewSize(pool, maxW, maxH)
     }
 
     private fun mapSensorRectToDisplay(r: RectF, caps: CameraDeviceCapabilities): RectF {
@@ -1223,24 +1413,20 @@ class CameraController(
 
     private fun closeReaders() {
         synchronized(readerLock) {
-            val readers = listOf(analysisYuvReader, stillJpegReader, stillRawReader, compYuvReader)
+            val readers = listOf(analysisYuvReader, stillJpegReader, stillRawReader)
             analysisYuvReader = null
             stillJpegReader = null
             stillRawReader = null
-            compYuvReader = null
             readers.forEach { r ->
                 runCatching {
                     r?.setOnImageAvailableListener(null, null)
                     r?.close()
                 }
             }
+            jpegQueue.clear()
             while (true) {
                 val img = rawQueue.poll() ?: break
                 runCatching { img.close() }
-            }
-            while (true) {
-                val bmp = compYuvQueue.poll() ?: break
-                if (!bmp.isRecycled) bmp.recycle()
             }
         }
     }
@@ -1248,6 +1434,10 @@ class CameraController(
     fun pauseCamera() {
         stopSensors()
         stopIntervalometer()
+        clearTapFocusState()
+        activeVideoSurface = null
+        activeHighSpeedConfig = null
+        currentVideoConfig = null
         sessionManager.closeDeviceOnly()
         closeReaders()
         runCatching { previewSurface?.release() }
@@ -1256,6 +1446,9 @@ class CameraController(
 
     fun releaseAll() {
         pauseCamera()
+        panoramaFrames.forEach { if (!it.isRecycled) it.recycle() }
+        panoramaFrames.clear()
+        _panoramaFramesCount.value = 0
         videoEngine.releaseInternal()
         qrEngine.close()
         mlKitClassifier.close()

@@ -19,24 +19,27 @@ class ComputationalPhotographyEngine(
         aiProfile: AiProcessingProfile?,
         fullPower: Boolean,
         liveShadowBias: Float,
-        liveHighlightBias: Float
+        liveHighlightBias: Float,
+        detailPreset: com.example.camera.ProcessingDetailPreset = com.example.camera.ProcessingDetailPreset.BALANCED,
+        lowLightAiBoost: Boolean = true
     ): LibPatcherConfig {
         val aiSharpDelta = if (aiProfile != null) (aiProfile.sharpnessAmount - 0.34f) * 0.45f else 0f
         val aiClarityDelta = if (aiProfile != null) (aiProfile.clarityAmount - 0.22f) * 0.45f else 0f
         val aiChromaDelta = if (aiProfile != null) (aiProfile.chromaDenoiseStrength - 0.30f) * 0.50f else 0f
         val aiVibDelta = if (aiProfile != null) (aiProfile.vibranceBoost - 0.14f) * 0.55f else 0f
-        val aiShadowDelta = if (aiProfile != null) (aiProfile.shadowLift - 0.08f) * 0.55f else 0f
+        val aiShadowDelta = if (aiProfile != null) (aiProfile.shadowLift - 0.08f) * (if (lowLightAiBoost) 0.65f else 0.40f) else 0f
         val aiHighDelta = if (aiProfile != null) (aiProfile.highlightCompress - 0.10f) * 0.55f else 0f
         val aiContrastDelta = if (aiProfile != null) (aiProfile.contrastAdjust - 0.06f) * 0.80f else 0f
         val aiSatDelta = if (aiProfile != null) (aiProfile.saturationAdjust - 0.04f) * 0.80f else 0f
         val aiWarmthDelta = if (aiProfile != null) aiProfile.warmthAdjust * 0.70f else 0f
 
         val turboBonus = if (fullPower) 0.07f else 0f
+        val lowLightDenoiseBonus = if (lowLightAiBoost && aiProfile != null && aiProfile.chromaDenoiseStrength > 0.38f) 0.08f else 0f
         return patch.copy(
-            sharpness = (patch.sharpness + aiSharpDelta + turboBonus).coerceIn(0f, 1.0f),
-            clarity = (patch.clarity + aiClarityDelta + turboBonus).coerceIn(0f, 0.8f),
-            lumaDenoise = (patch.lumaDenoise + if (fullPower) 0.05f else 0f).coerceIn(0f, 0.8f),
-            chromaDenoise = (patch.chromaDenoise + aiChromaDelta + if (fullPower) 0.06f else 0f).coerceIn(0f, 0.85f),
+            sharpness = (patch.sharpness + aiSharpDelta + turboBonus + detailPreset.sharpnessDelta).coerceIn(0f, 1.0f),
+            clarity = (patch.clarity + aiClarityDelta + turboBonus + detailPreset.clarityDelta).coerceIn(0f, 0.8f),
+            lumaDenoise = ((patch.lumaDenoise + if (fullPower) 0.05f else 0f + lowLightDenoiseBonus * 0.5f) * detailPreset.denoiseMult).coerceIn(0f, 0.8f),
+            chromaDenoise = ((patch.chromaDenoise + aiChromaDelta + if (fullPower) 0.06f else 0f + lowLightDenoiseBonus) * detailPreset.denoiseMult).coerceIn(0f, 0.85f),
             contrast = (patch.contrast + aiContrastDelta).coerceIn(-0.35f, 0.45f),
             saturation = (patch.saturation + aiSatDelta).coerceIn(-0.40f, 0.50f),
             vibrance = (patch.vibrance + aiVibDelta + if (fullPower) 0.04f else 0f).coerceIn(0f, 0.50f),
@@ -53,9 +56,11 @@ class ComputationalPhotographyEngine(
         fullPower: Boolean = false,
         libPatcher: LibPatcherConfig = LibPatcherConfig(),
         liveShadowBias: Float = 0f,
-        liveHighlightBias: Float = 0f
+        liveHighlightBias: Float = 0f,
+        detailPreset: com.example.camera.ProcessingDetailPreset = com.example.camera.ProcessingDetailPreset.BALANCED,
+        lowLightAiBoost: Boolean = true
     ): MotionAssessment {
-        val merged = mergeEffectivePatch(libPatcher, aiProfile, fullPower, liveShadowBias, liveHighlightBias)
+        val merged = mergeEffectivePatch(libPatcher, aiProfile, fullPower, liveShadowBias, liveHighlightBias, detailPreset, lowLightAiBoost)
         val config = EnhanceConfig(
             sharpnessAmount = if (aiProfile == null && sharpnessAmount != 0.34f) sharpnessAmount else merged.sharpness,
             clarityAmount = merged.clarity,
@@ -78,9 +83,11 @@ class ComputationalPhotographyEngine(
         fullPower: Boolean = false,
         libPatcher: LibPatcherConfig = LibPatcherConfig(),
         liveShadowBias: Float = 0f,
-        liveHighlightBias: Float = 0f
+        liveHighlightBias: Float = 0f,
+        detailPreset: com.example.camera.ProcessingDetailPreset = com.example.camera.ProcessingDetailPreset.BALANCED,
+        lowLightAiBoost: Boolean = true
     ): Bitmap {
-        val merged = mergeEffectivePatch(libPatcher, aiProfile, fullPower, liveShadowBias, liveHighlightBias)
+        val merged = mergeEffectivePatch(libPatcher, aiProfile, fullPower, liveShadowBias, liveHighlightBias, detailPreset, lowLightAiBoost)
         val config = EnhanceConfig(
             sharpnessAmount = ((merged.sharpness + sharpnessAmount) * 0.5f + if (fullPower) 0.05f else 0f).coerceIn(0.10f, 1.0f),
             clarityAmount = merged.clarity,
@@ -103,10 +110,12 @@ class ComputationalPhotographyEngine(
         fullPower: Boolean = false,
         libPatcher: LibPatcherConfig = LibPatcherConfig(),
         liveShadowBias: Float = 0f,
-        liveHighlightBias: Float = 0f
+        liveHighlightBias: Float = 0f,
+        detailPreset: com.example.camera.ProcessingDetailPreset = com.example.camera.ProcessingDetailPreset.BALANCED,
+        lowLightAiBoost: Boolean = true
     ): Bitmap {
         val bokeh = portraitProcessor.applyPortraitBokeh(src, facesNormalized, blurIntensity, fullPower = fullPower)
-        val merged = mergeEffectivePatch(libPatcher, aiProfile, fullPower, liveShadowBias, liveHighlightBias)
+        val merged = mergeEffectivePatch(libPatcher, aiProfile, fullPower, liveShadowBias, liveHighlightBias, detailPreset, lowLightAiBoost)
         val config = EnhanceConfig(
             sharpnessAmount = (merged.sharpness * 0.80f).coerceIn(0.15f, 0.55f),
             clarityAmount = (merged.clarity * 0.65f).coerceIn(0.08f, 0.30f),

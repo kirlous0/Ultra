@@ -66,10 +66,16 @@ import androidx.compose.ui.unit.dp
 import androidx.lifecycle.compose.collectAsStateWithLifecycle
 import coil.compose.AsyncImage
 import com.example.camera.AppDestination
+import com.example.camera.BackgroundProcessingJob
+import com.example.camera.BackgroundProcessingStage
 import com.example.system.AppStrings
 import com.example.system.ExifMetadata
 import com.example.system.GalleryItem
 import com.example.ui.MainViewModel
+import androidx.compose.foundation.Image
+import androidx.compose.material3.LinearProgressIndicator
+import androidx.compose.ui.graphics.asImageBitmap
+import androidx.compose.ui.text.font.FontWeight
 import com.example.ui.theme.AmberFocus
 import com.example.ui.theme.CarbonSurface
 import com.example.ui.theme.CrimsonRecord
@@ -89,6 +95,7 @@ fun GalleryScreen(
 ) {
     val context = LocalContext.current
     val items by viewModel.galleryItems.collectAsStateWithLifecycle()
+    val processingJobs by viewModel.processingJobs.collectAsStateWithLifecycle()
     val selectedItem by viewModel.selectedGalleryItem.collectAsStateWithLifecycle()
     val selectedExif by viewModel.selectedExif.collectAsStateWithLifecycle()
     var showExifSheet by remember { mutableStateOf(true) }
@@ -129,7 +136,7 @@ fun GalleryScreen(
                         onClick = {
                             if (selectedItem != null) {
                                 viewModel.selectGalleryItem(null)
-                                showExifSheet = false
+                                showExifSheet = true
                             } else {
                                 viewModel.navigateTo(AppDestination.CAMERA)
                             }
@@ -177,12 +184,14 @@ fun GalleryScreen(
                             )
                         }
                         IconButton(onClick = {
-                            val share = Intent(Intent.ACTION_SEND).apply {
-                                type = cur.mimeType
-                                putExtra(Intent.EXTRA_STREAM, cur.uri)
-                                addFlags(Intent.FLAG_GRANT_READ_URI_PERMISSION)
+                            runCatching {
+                                val share = Intent(Intent.ACTION_SEND).apply {
+                                    type = cur.mimeType
+                                    putExtra(Intent.EXTRA_STREAM, cur.uri)
+                                    addFlags(Intent.FLAG_GRANT_READ_URI_PERMISSION)
+                                }
+                                context.startActivity(Intent.createChooser(share, cur.displayName))
                             }
-                            context.startActivity(Intent.createChooser(share, cur.displayName))
                         }) {
                             Icon(Icons.Filled.Share, contentDescription = "Share", tint = TextPrimary)
                         }
@@ -283,58 +292,79 @@ fun GalleryScreen(
                 }
             }
         } else if (items.isEmpty()) {
-            Box(
+            Column(
                 modifier = Modifier
                     .fillMaxSize()
                     .padding(padding)
-                    .padding(24.dp),
-                contentAlignment = Alignment.Center
+                    .padding(12.dp)
             ) {
-                Column(
-                    horizontalAlignment = Alignment.CenterHorizontally,
-                    verticalArrangement = Arrangement.spacedBy(12.dp)
+                if (processingJobs.isNotEmpty()) {
+                    GalleryProcessingBanner(jobs = processingJobs, strings = strings)
+                    Spacer(Modifier.height(12.dp))
+                }
+                Box(
+                    modifier = Modifier
+                        .fillMaxSize()
+                        .padding(12.dp),
+                    contentAlignment = Alignment.Center
                 ) {
-                    Icon(
-                        imageVector = Icons.Filled.PhotoLibrary,
-                        contentDescription = null,
-                        tint = AmberFocus,
-                        modifier = Modifier.size(56.dp)
-                    )
-                    Text(strings.emptyGalleryTitle, style = MaterialTheme.typography.headlineSmall, color = TextPrimary)
-                    Text(strings.emptyGallerySubtitle, style = MaterialTheme.typography.bodyMedium, color = TextSecondary)
-                    Button(
-                        onClick = {
-                            photoPicker.launch(
-                                PickVisualMediaRequest(ActivityResultContracts.PickVisualMedia.ImageOnly)
-                            )
-                        },
-                        colors = ButtonDefaults.buttonColors(containerColor = AmberFocus, contentColor = ObsidianVoid)
+                    Column(
+                        horizontalAlignment = Alignment.CenterHorizontally,
+                        verticalArrangement = Arrangement.spacedBy(12.dp)
                     ) {
-                        Text(strings.importFromPhotos)
+                        Icon(
+                            imageVector = Icons.Filled.PhotoLibrary,
+                            contentDescription = null,
+                            tint = AmberFocus,
+                            modifier = Modifier.size(56.dp)
+                        )
+                        Text(strings.emptyGalleryTitle, style = MaterialTheme.typography.headlineSmall, color = TextPrimary)
+                        Text(strings.emptyGallerySubtitle, style = MaterialTheme.typography.bodyMedium, color = TextSecondary)
+                        Button(
+                            onClick = {
+                                photoPicker.launch(
+                                    PickVisualMediaRequest(ActivityResultContracts.PickVisualMedia.ImageOnly)
+                                )
+                            },
+                            colors = ButtonDefaults.buttonColors(containerColor = AmberFocus, contentColor = ObsidianVoid)
+                        ) {
+                            Text(strings.importFromPhotos)
+                        }
                     }
                 }
             }
         } else {
-            LazyVerticalGrid(
-                columns = GridCells.Adaptive(minSize = 112.dp),
-                contentPadding = PaddingValues(
-                    start = 10.dp,
-                    end = 10.dp,
-                    top = padding.calculateTopPadding() + 10.dp,
-                    bottom = padding.calculateBottomPadding() + 16.dp
-                ),
-                horizontalArrangement = Arrangement.spacedBy(8.dp),
-                verticalArrangement = Arrangement.spacedBy(8.dp),
-                modifier = Modifier.fillMaxSize()
+            Column(
+                modifier = Modifier
+                    .fillMaxSize()
+                    .padding(padding)
             ) {
-                items(items, key = { it.uri.toString() }) { item ->
-                    GalleryGridCell(
-                        item = item,
-                        onClick = {
-                            showExifSheet = true
-                            viewModel.selectGalleryItem(item)
-                        }
-                    )
+                if (processingJobs.isNotEmpty()) {
+                    Box(modifier = Modifier.padding(horizontal = 10.dp, vertical = 8.dp)) {
+                        GalleryProcessingBanner(jobs = processingJobs, strings = strings)
+                    }
+                }
+                LazyVerticalGrid(
+                    columns = GridCells.Adaptive(minSize = 112.dp),
+                    contentPadding = PaddingValues(
+                        start = 10.dp,
+                        end = 10.dp,
+                        top = 10.dp,
+                        bottom = 16.dp
+                    ),
+                    horizontalArrangement = Arrangement.spacedBy(8.dp),
+                    verticalArrangement = Arrangement.spacedBy(8.dp),
+                    modifier = Modifier.fillMaxSize()
+                ) {
+                    items(items, key = { it.uri.toString() }) { item ->
+                        GalleryGridCell(
+                            item = item,
+                            onClick = {
+                                showExifSheet = true
+                                viewModel.selectGalleryItem(item)
+                            }
+                        )
+                    }
                 }
             }
         }
@@ -455,5 +485,83 @@ private fun ExifRow(label: String, value: String) {
     ) {
         Text(label, style = MaterialTheme.typography.bodyMedium, color = TextSecondary)
         Text(value, style = MaterialTheme.typography.labelMedium, color = TextPrimary)
+    }
+}
+
+@Composable
+private fun GalleryProcessingBanner(
+    jobs: List<BackgroundProcessingJob>,
+    strings: AppStrings
+) {
+    val job = jobs.lastOrNull() ?: return
+    val stageText = when (job.stage) {
+        BackgroundProcessingStage.ALIGNING -> strings.aligningFrames
+        BackgroundProcessingStage.MERGING_HDR -> strings.mergingHdr
+        BackgroundProcessingStage.MERGING_NIGHT -> strings.mergingNight
+        BackgroundProcessingStage.SUPER_RES -> strings.superResReconstructing
+        BackgroundProcessingStage.ENHANCING -> strings.processingStageEnhancing
+        BackgroundProcessingStage.SAVING -> strings.processingStageSaving
+    }
+    Card(
+        colors = CardDefaults.cardColors(containerColor = CarbonSurface),
+        shape = RoundedCornerShape(14.dp),
+        border = androidx.compose.foundation.BorderStroke(1.dp, AmberFocus.copy(alpha = 0.7f)),
+        modifier = Modifier
+            .fillMaxWidth()
+            .testTag("gallery_processing_banner")
+    ) {
+        Row(
+            modifier = Modifier.padding(10.dp),
+            verticalAlignment = Alignment.CenterVertically,
+            horizontalArrangement = Arrangement.spacedBy(10.dp)
+        ) {
+            val bmp = job.previewBitmap
+            if (bmp != null && !bmp.isRecycled) {
+                Image(
+                    bitmap = bmp.asImageBitmap(),
+                    contentDescription = job.modeTag,
+                    contentScale = ContentScale.Crop,
+                    modifier = Modifier
+                        .size(44.dp)
+                        .clip(RoundedCornerShape(8.dp))
+                )
+            }
+            Column(
+                modifier = Modifier.weight(1f),
+                verticalArrangement = Arrangement.spacedBy(4.dp)
+            ) {
+                Row(
+                    modifier = Modifier.fillMaxWidth(),
+                    horizontalArrangement = Arrangement.SpaceBetween
+                ) {
+                    Text(
+                        text = "${job.modeTag} · ${strings.processingInProgressTitle}",
+                        style = MaterialTheme.typography.labelMedium,
+                        fontWeight = FontWeight.Bold,
+                        color = AmberFocus
+                    )
+                    Text(
+                        text = "${(job.progress * 100).toInt()}%",
+                        style = MaterialTheme.typography.labelSmall,
+                        color = TextPrimary
+                    )
+                }
+                Text(
+                    text = stageText,
+                    style = MaterialTheme.typography.labelSmall,
+                    color = TextSecondary,
+                    maxLines = 1
+                )
+                LinearProgressIndicator(
+                    progress = { job.progress },
+                    color = AmberFocus,
+                    trackColor = ObsidianVoid,
+                    modifier = Modifier
+                        .fillMaxWidth()
+                        .height(5.dp)
+                        .clip(RoundedCornerShape(4.dp))
+                )
+            }
+        }
     }
 }

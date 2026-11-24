@@ -29,7 +29,9 @@ data class FrameAnalysisResult(
     val redHighlightClipPercent: Float = 0f,
     val greenHighlightClipPercent: Float = 0f,
     val blueHighlightClipPercent: Float = 0f,
-    val focusSharpnessPercent: Int = 0
+    val focusSharpnessPercent: Int = 0,
+    val darkShadowRatio: Float = 0f,
+    val artificialWarmCast: Float = 0f
 )
 
 object YuvUtils {
@@ -124,6 +126,9 @@ object YuvUtils {
         var warmCount = 0
         var greenCount = 0
         var blueSkyCount = 0
+        var darkShadowCount = 0
+        var sumR = 0L
+        var sumB = 0L
 
         val halfH = height / 2
         var y = 0
@@ -150,10 +155,13 @@ object YuvUtils {
 
                     if (yVal >= 245) highlightClips++
                     if (yVal <= 10) shadowClips++
+                    if (yVal < 48) darkShadowCount++
+                    sumLuma += yVal
+                    sumR += r
+                    sumB += b
                     if (r >= 248) rClips++
                     if (g >= 248) gClips++
                     if (b >= 248) bClips++
-                    sumLuma += yVal
                     if (y < halfH) {
                         topLumaSum += yVal
                         topCount++
@@ -174,6 +182,9 @@ object YuvUtils {
 
         val denom = totalSamples.coerceAtLeast(1).toFloat()
         val meanLuma = sumLuma / denom
+        val meanR = sumR / denom
+        val meanB = sumB / denom
+        val artificialWarmCast = ((meanR - meanB) / (meanR + meanB + 1f)).coerceIn(-1f, 1f)
         val topMean = if (topCount > 0) topLumaSum.toFloat() / topCount else meanLuma
         val bottomMean = if (bottomCount > 0) bottomLumaSum.toFloat() / bottomCount else meanLuma
         val topBottomRatio = if (bottomMean > 1f) topMean / bottomMean else 1f
@@ -194,17 +205,18 @@ object YuvUtils {
 
         val baseRgb = peakingColorArgb and 0x00FFFFFF
         val strongColor = (0xFF shl 24) or baseRgb
-        val softColor = (0xA8 shl 24) or baseRgb
-        val strongCutoff = (peakingThreshold * 1.55f).toInt().coerceAtLeast(peakingThreshold + 24)
+        val softColor = (0xB8 shl 24) or baseRgb
+        val strongCutoff = (peakingThreshold * 1.6f).toInt().coerceAtLeast(peakingThreshold + 20)
+        val pixStep = (width / 360).coerceIn(1, 2)
 
         for (gy in 1 until gridH - 1) {
-            val sy = gy * height / gridH
-            val syPrev = (gy - 1) * height / gridH
-            val syNext = (gy + 1) * height / gridH
+            val sy = (gy * height / gridH).coerceIn(pixStep, height - 1 - pixStep)
+            val syPrev = sy - pixStep
+            val syNext = sy + pixStep
             for (gx in 1 until gridW - 1) {
-                val sx = gx * width / gridW
-                val sxPrev = (gx - 1) * width / gridW
-                val sxNext = (gx + 1) * width / gridW
+                val sx = (gx * width / gridW).coerceIn(pixStep, width - 1 - pixStep)
+                val sxPrev = sx - pixStep
+                val sxNext = sx + pixStep
 
                 val c = yAt(yBytes, sy, sx, yRowStride, yPixStride)
                 val l = yAt(yBytes, sy, sxPrev, yRowStride, yPixStride)
@@ -213,7 +225,7 @@ object YuvUtils {
                 val b = yAt(yBytes, syNext, sx, yRowStride, yPixStride)
 
                 val edgeResp = computeFocusEdgeResponse(c, l, r, t, b)
-                if (edgeResp > 52) edgeHits++
+                if (edgeResp > 28) edgeHits++
                 if (edgeResp >= peakingThreshold) {
                     peakHits++
                     peakEnergySum += (edgeResp - peakingThreshold).coerceAtMost(220)
@@ -224,7 +236,13 @@ object YuvUtils {
                     val (ox, oy) = mapOverlayCoord(gx, gy, gridW, gridH, rot, mirrorHorizontal)
                     val outIdx = oy * outW + ox
                     if (peakingPixels != null && edgeResp >= peakingThreshold && outIdx in peakingPixels.indices) {
-                        peakingPixels[outIdx] = if (edgeResp >= strongCutoff) strongColor else softColor
+                        val color = if (edgeResp >= strongCutoff) strongColor else softColor
+                        peakingPixels[outIdx] = color
+                        // 1px orthogonal halo on crisp peak edges so thin lines stay clearly visible on high-DPI screens
+                        if (edgeResp >= strongCutoff && ox + 1 < outW) {
+                            val adjIdx = oy * outW + (ox + 1)
+                            if (peakingPixels[adjIdx] == 0) peakingPixels[adjIdx] = softColor
+                        }
                     }
                     if (zebraPixels != null && outIdx in zebraPixels.indices) {
                         val stripe = ((ox + oy) % 6) < 3
@@ -246,7 +264,7 @@ object YuvUtils {
         }
         val peakDensity = (peakHits.toFloat() / edgeTotal.coerceAtLeast(1)) * 100f
         val meanPeakIntensity = if (peakHits > 0) peakEnergySum.toFloat() / peakHits else 0f
-        val focusSharpnessPercent = ((peakDensity * 4.5f) + (meanPeakIntensity * 0.45f))
+        val focusSharpnessPercent = ((peakDensity * 5.2f) + (meanPeakIntensity * 0.50f))
             .toInt()
             .coerceIn(0, 100)
 
@@ -268,7 +286,9 @@ object YuvUtils {
             redHighlightClipPercent = (rClips * 100f) / denom,
             greenHighlightClipPercent = (gClips * 100f) / denom,
             blueHighlightClipPercent = (bClips * 100f) / denom,
-            focusSharpnessPercent = focusSharpnessPercent
+            focusSharpnessPercent = focusSharpnessPercent,
+            darkShadowRatio = darkShadowCount / denom,
+            artificialWarmCast = artificialWarmCast
         )
     }
 
@@ -312,6 +332,13 @@ object YuvUtils {
         val rotated = Bitmap.createBitmap(bitmap, 0, 0, bitmap.width, bitmap.height, matrix, true)
         if (rotated !== bitmap) bitmap.recycle()
         return rotated
+    }
+
+    fun mirrorBitmapHorizontal(bitmap: Bitmap): Bitmap {
+        val matrix = Matrix().apply { postScale(-1f, 1f, bitmap.width * 0.5f, bitmap.height * 0.5f) }
+        val mirrored = Bitmap.createBitmap(bitmap, 0, 0, bitmap.width, bitmap.height, matrix, true)
+        if (mirrored !== bitmap) bitmap.recycle()
+        return mirrored
     }
 
     fun decodeJpegDownsampled(bytes: ByteArray, maxDim: Int = 2560): Bitmap {

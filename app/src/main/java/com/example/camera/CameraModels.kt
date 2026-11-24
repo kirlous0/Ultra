@@ -53,12 +53,50 @@ enum class WatermarkStyle {
 }
 
 @Immutable
-enum class GridOverlayType {
-    NONE,
-    RULE_OF_THIRDS,
-    GOLDEN_RATIO,
-    SQUARE,
-    CROSSHAIR
+enum class GridOverlayType(val labelEn: String, val labelAr: String) {
+    NONE("Off", "إيقاف"),
+    RULE_OF_THIRDS("3×3 Thirds", "شبكة 3×3 (الأثلاث)"),
+    GOLDEN_RATIO("Phi Grid (1:1.618)", "شبكة فاي (Phi)"),
+    SQUARE("1:1 Square", "إطار مربع 1:1"),
+    CROSSHAIR("Center Crosshair", "مؤشر المنتصف")
+}
+
+@Immutable
+enum class GridLineColor(val labelEn: String, val labelAr: String, val argb: Int) {
+    WHITE("White", "أبيض", 0xFFFFFFFF.toInt()),
+    AMBER("Amber", "ذهبي", 0xFFFFB300.toInt()),
+    CYAN("Cyan", "سماوي", 0xFF00E5FF.toInt()),
+    EMERALD("Green", "أخضر", 0xFF22FF66.toInt())
+}
+
+@Immutable
+enum class GridLineThickness(val labelEn: String, val labelAr: String, val strokePx: Float) {
+    THIN("Thin", "رفيع", 1.2f),
+    MEDIUM("Med", "متوسط", 2.0f),
+    BOLD("Bold", "سميك", 3.2f)
+}
+
+@Immutable
+data class GridOverlayConfig(
+    val type: GridOverlayType = GridOverlayType.RULE_OF_THIRDS,
+    val opacity: Float = 0.50f,
+    val thickness: GridLineThickness = GridLineThickness.MEDIUM,
+    val color: GridLineColor = GridLineColor.WHITE,
+    val showDiagonals: Boolean = false,
+    val showIntersectionDots: Boolean = false
+)
+
+@Immutable
+enum class ProcessingDetailPreset(
+    val labelEn: String,
+    val labelAr: String,
+    val sharpnessDelta: Float,
+    val clarityDelta: Float,
+    val denoiseMult: Float
+) {
+    NATURAL("Natural", "طبيعي ناعم", -0.08f, -0.04f, 0.85f),
+    BALANCED("Balanced", "متوازن", 0.0f, 0.0f, 1.0f),
+    ULTRA_CRISP("Ultra Crisp", "حدة فائقة", +0.14f, +0.10f, 1.15f)
 }
 
 @Immutable
@@ -99,9 +137,9 @@ enum class FocusPeakingColor(val labelEn: String, val labelAr: String, val argb:
 
 @Immutable
 enum class FocusPeakingSensitivity(val labelEn: String, val labelAr: String, val threshold: Int) {
-    LOW("Low", "منخفض", 92),
-    MEDIUM("Med", "متوسط", 62),
-    HIGH("High", "عالي", 40)
+    LOW("Low", "منخفض", 58),
+    MEDIUM("Med", "متوسط", 32),
+    HIGH("High", "عالي", 16)
 }
 
 @Immutable
@@ -268,7 +306,8 @@ data class ProControlsState(
     val digitalZoomRatio: Float = 1.0f,
     val antiBanding: AntiBandingOption = AntiBandingOption.HZ_50,
     val burstEnabledInPro: Boolean = false,
-    val burstFrameCount: Int = 5
+    val burstFrameCount: Int = 5,
+    val manualShutterPinned: Boolean = false
 )
 
 @Immutable
@@ -277,6 +316,26 @@ data class BurstCaptureProgress(
     val targetCount: Int = 0,
     val achievedFps: Float = 0f,
     val isContinuousHold: Boolean = false
+)
+
+@Immutable
+enum class BackgroundProcessingStage {
+    ALIGNING,
+    MERGING_HDR,
+    MERGING_NIGHT,
+    SUPER_RES,
+    ENHANCING,
+    SAVING
+}
+
+@Immutable
+data class BackgroundProcessingJob(
+    val id: Long,
+    val modeTag: String,
+    val stage: BackgroundProcessingStage = BackgroundProcessingStage.ALIGNING,
+    val progress: Float = 0.15f,
+    val previewBitmap: android.graphics.Bitmap? = null,
+    val startedAtMs: Long = System.currentTimeMillis()
 )
 
 @Immutable
@@ -380,4 +439,27 @@ fun clampProControlsToCamera(
         burstEnabledInPro = controls.burstEnabledInPro && validFmt == CaptureFormat.JPEG,
         burstFrameCount = controls.burstFrameCount.coerceIn(3, 12)
     )
+}
+
+/**
+ * Computes an exposure-matched shutter time when user sets a manual ISO (ISO-priority)
+ * using live AE telemetry and EV bias, keeping handheld shake in check for Galaxy A05s.
+ */
+fun computeIsoPriorityShutterNs(
+    targetIso: Int,
+    liveIso: Int,
+    liveExposureNs: Long,
+    evSteps: Int = 0,
+    evStepSize: Float = 0.1f,
+    exposureRange: LongRange? = null,
+    maxHandheldNs: Long = 100_000_000L
+): Long {
+    val safeTargetIso = targetIso.coerceAtLeast(50)
+    val baseIso = if (liveIso > 0) liveIso else 200
+    val baseExp = if (liveExposureNs > 0L) liveExposureNs else 16_666_666L
+    val minExp = exposureRange?.first ?: 100_000L
+    val maxExp = minOf(exposureRange?.last ?: 500_000_000L, maxHandheldNs).coerceAtLeast(minExp)
+    val evMult = Math.pow(2.0, (evSteps * evStepSize).toDouble())
+    val scaled = (baseExp.toDouble() * (baseIso.toDouble() / safeTargetIso.toDouble()) * evMult).toLong()
+    return scaled.coerceIn(minExp, maxExp)
 }

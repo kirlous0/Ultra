@@ -73,7 +73,8 @@ class AIPhotographyEngine {
         exposureRangeNs: LongRange?,
         aeCompRange: IntRange,
         fullPower: Boolean = false,
-        mlKitLabels: List<SceneLabelObservation> = emptyList()
+        mlKitLabels: List<SceneLabelObservation> = emptyList(),
+        lowLightAiBoost: Boolean = true
     ): AiRecommendation {
         val scores = FloatArray(RecognizedScene.entries.size)
 
@@ -81,7 +82,10 @@ class AIPhotographyEngine {
         val isHighContrast = dynamicSpread > 0.62f ||
             (analysis.highlightClipPercent > 2.2f && analysis.shadowClipPercent > 3.0f)
 
-        val isLowLight = currentIso >= 640 || currentExposureNs >= 33_000_000L || analysis.meanLuma < 58f
+        val isLowLight = currentIso >= 640 ||
+            currentExposureNs >= 33_000_000L ||
+            analysis.meanLuma < 58f ||
+            analysis.darkShadowRatio > 0.56f
         val isBrightOutdoor = currentIso <= 125 && currentExposureNs <= 5_000_000L && analysis.meanLuma > 105f
         val isBacklit = (analysis.topBottomLumaRatio > 1.85f || isHighContrast) &&
             (analysis.highlightClipPercent > 3.2f || analysis.shadowClipPercent > 5.5f)
@@ -92,7 +96,9 @@ class AIPhotographyEngine {
             scores[RecognizedScene.PORTRAIT.ordinal] += 0.72f + (faceCount * 0.08f).coerceAtMost(0.24f)
         }
         if (isLowLight) {
-            scores[RecognizedScene.NIGHT.ordinal] += 0.65f + ((80f - analysis.meanLuma).coerceAtLeast(0f) / 100f)
+            scores[RecognizedScene.NIGHT.ordinal] += 0.65f +
+                ((80f - analysis.meanLuma).coerceAtLeast(0f) / 100f) +
+                (analysis.darkShadowRatio * 0.25f)
         }
         if (isBacklit) {
             scores[RecognizedScene.BACKLIT.ordinal] += 0.70f
@@ -259,19 +265,34 @@ class AIPhotographyEngine {
             )
         }
 
-        // Adapt profile dynamically based on live histogram clipping & ISO noise
-        val highIsoBonus = if (currentIso >= 800) 0.12f else 0f
-        val clipShadowExtra = (analysis.shadowClipPercent / 100f * 0.6f).coerceIn(0f, 0.08f)
-        val clipHighExtra = (analysis.highlightClipPercent / 100f * 0.6f).coerceIn(0f, 0.08f)
+        // Adapt profile dynamically based on live histogram clipping, shadow density, & ISO noise
+        val highIsoBonus = if (currentIso >= 800) 0.14f else if (currentIso >= 400) 0.06f else 0f
+        val dimLightExtra = if (lowLightAiBoost && (isLowLight || analysis.darkShadowRatio > 0.42f)) {
+            ((analysis.darkShadowRatio * 0.14f) + if (isLowLight) 0.08f else 0.03f).coerceIn(0f, 0.18f)
+        } else 0f
+        val clipShadowExtra = (analysis.shadowClipPercent / 100f * 0.65f + dimLightExtra * 0.45f).coerceIn(0f, 0.12f)
+        val clipHighExtra = (analysis.highlightClipPercent / 100f * 0.6f).coerceIn(0f, 0.09f)
+
+        // Neutralize heavy sodium/tungsten color cast in poor lighting when no manual override is set
+        val castWarmTrim = if (lowLightAiBoost && isLowLight && analysis.artificialWarmCast > 0.24f) -0.045f else 0f
+        val adaptedWb = if (lowLightAiBoost &&
+            (scene == RecognizedScene.INDOOR || scene == RecognizedScene.NIGHT) &&
+            analysis.artificialWarmCast > 0.28f &&
+            rec.wb == WhiteBalancePreset.AUTO
+        ) {
+            WhiteBalancePreset.TUNGSTEN
+        } else rec.wb
 
         val baseProfile = rec.profile
         val adaptedProfile = baseProfile.copy(
             sharpnessAmount = (baseProfile.sharpnessAmount + if (fullPower) 0.10f else 0f).coerceIn(0.18f, 0.72f),
             clarityAmount = (baseProfile.clarityAmount + if (fullPower) 0.08f else 0f).coerceIn(0.10f, 0.44f),
-            chromaDenoiseStrength = (baseProfile.chromaDenoiseStrength + highIsoBonus + if (fullPower) 0.08f else 0f).coerceIn(0.15f, 0.70f),
+            chromaDenoiseStrength = (baseProfile.chromaDenoiseStrength + highIsoBonus + dimLightExtra + if (fullPower) 0.08f else 0f).coerceIn(0.15f, 0.78f),
             vibranceBoost = (baseProfile.vibranceBoost + if (fullPower) 0.05f else 0f).coerceIn(0.02f, 0.30f),
-            shadowLift = (baseProfile.shadowLift + clipShadowExtra + if (fullPower) 0.03f else 0f).coerceIn(0.02f, 0.28f),
-            highlightCompress = (baseProfile.highlightCompress + clipHighExtra + if (fullPower) 0.03f else 0f).coerceIn(0.04f, 0.28f),
+            shadowLift = (baseProfile.shadowLift + clipShadowExtra + if (fullPower) 0.03f else 0f).coerceIn(0.02f, 0.34f),
+            highlightCompress = (baseProfile.highlightCompress + clipHighExtra + if (fullPower) 0.03f else 0f).coerceIn(0.04f, 0.30f),
+            contrastAdjust = (baseProfile.contrastAdjust + if (isLowLight && lowLightAiBoost) 0.03f else 0f).coerceIn(-0.20f, 0.28f),
+            warmthAdjust = (baseProfile.warmthAdjust + castWarmTrim).coerceIn(-0.18f, 0.18f),
             videoBitrateMultiplier = (baseProfile.videoBitrateMultiplier * if (fullPower) 1.25f else 1.0f).coerceIn(1.0f, 1.65f)
         )
 
@@ -285,8 +306,8 @@ class AIPhotographyEngine {
             recommendedIso = clampedIso,
             recommendedShutterNs = clampedShutter,
             recommendedEvSteps = clampedEv,
-            recommendedWb = rec.wb,
-            recommendHdr = rec.hdr || isHighContrast,
+            recommendedWb = adaptedWb,
+            recommendHdr = rec.hdr || isHighContrast || (isLowLight && analysis.highlightClipPercent > 1.8f),
             recommendedMode = rec.mode,
             profile = adaptedProfile,
             mlKitLabel = topMatchedLabel?.label,

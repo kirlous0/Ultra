@@ -22,14 +22,16 @@ class ManualCameraController {
         eisEnabled: Boolean,
         aiProfile: AiProcessingProfile? = null,
         focusPowerMode: Boolean = false,
-        aiAutoWb: WhiteBalancePreset? = null
+        aiAutoWb: WhiteBalancePreset? = null,
+        meteringRegions: Array<MeteringRectangle>? = null,
+        holdTapAfAuto: Boolean = false
     ) {
         // Anti-banding (50Hz Egypt default when supported)
         val requestedAb = controls.antiBanding.camera2Value
         builder.set(CaptureRequest.CONTROL_AE_ANTIBANDING_MODE, requestedAb)
 
-        // Exposure & AE mode
-        if (controls.isManualMode && controls.manualExposureEnabled && caps.supportsManualSensor) {
+        // Exposure & AE mode (honored in Pro, Night, Camera, and HDR whenever manual exposure is enabled)
+        if (controls.manualExposureEnabled && caps.supportsManualSensor) {
             builder.set(CaptureRequest.CONTROL_MODE, CameraMetadata.CONTROL_MODE_AUTO)
             builder.set(CaptureRequest.CONTROL_AE_MODE, CameraMetadata.CONTROL_AE_MODE_OFF)
 
@@ -54,6 +56,9 @@ class ManualCameraController {
                 caps.aeCompensationRange.last
             )
             builder.set(CaptureRequest.CONTROL_AE_EXPOSURE_COMPENSATION, ev)
+            if (meteringRegions != null) {
+                runCatching { builder.set(CaptureRequest.CONTROL_AE_REGIONS, meteringRegions) }
+            }
         }
 
         // Flash / Torch
@@ -71,14 +76,18 @@ class ManualCameraController {
         // Focus mode: strictly never set manual focus on fixed-focus lenses (e.g., front camera)
         if (controls.manualFocusEnabled && caps.supportsManualFocus) {
             builder.set(CaptureRequest.CONTROL_AF_MODE, CameraMetadata.CONTROL_AF_MODE_OFF)
+            builder.set(CaptureRequest.CONTROL_AF_TRIGGER, CameraMetadata.CONTROL_AF_TRIGGER_IDLE)
             val dist = controls.focusDistanceDiopters.coerceIn(0f, caps.minimumFocusDistance)
             builder.set(CaptureRequest.LENS_FOCUS_DISTANCE, dist)
-        } else if (controls.afLocked && caps.supportsManualFocus &&
+        } else if ((controls.afLocked || holdTapAfAuto) && caps.supportsManualFocus &&
             caps.afModes.contains(CameraMetadata.CONTROL_AF_MODE_AUTO)
         ) {
-            // Hold locked focus without continuous refocus hunting
+            // Preserve tap-to-focus region & AUTO focus state while converging or AF-locked
             builder.set(CaptureRequest.CONTROL_AF_MODE, CameraMetadata.CONTROL_AF_MODE_AUTO)
             builder.set(CaptureRequest.CONTROL_AF_TRIGGER, CameraMetadata.CONTROL_AF_TRIGGER_IDLE)
+            if (meteringRegions != null) {
+                runCatching { builder.set(CaptureRequest.CONTROL_AF_REGIONS, meteringRegions) }
+            }
         } else if (caps.afModes.isNotEmpty()) {
             val preferredAf = when {
                 isVideoMode && caps.afModes.contains(CameraMetadata.CONTROL_AF_MODE_CONTINUOUS_VIDEO) ->
@@ -92,6 +101,9 @@ class ManualCameraController {
                 else -> caps.afModes.first()
             }
             builder.set(CaptureRequest.CONTROL_AF_MODE, preferredAf)
+            if (meteringRegions != null && caps.supportsManualFocus) {
+                runCatching { builder.set(CaptureRequest.CONTROL_AF_REGIONS, meteringRegions) }
+            }
         }
 
         // White Balance
@@ -111,9 +123,9 @@ class ManualCameraController {
                 CaptureRequest.COLOR_CORRECTION_TRANSFORM,
                 ColorSpaceTransform(
                     intArrayOf(
-                        1, 1, 0, 1, 0, 1,
-                        0, 1, 1, 1, 0, 1,
-                        0, 1, 0, 1, 1, 1
+                        155, 100, -40, 100, -15, 100,
+                        -25, 100, 145, 100, -20, 100,
+                        -8, 100, -45, 100, 153, 100
                     )
                 )
             )
@@ -130,6 +142,14 @@ class ManualCameraController {
             val awb = if (caps.awbModes.contains(requestedAwb)) requestedAwb
             else CameraMetadata.CONTROL_AWB_MODE_AUTO
             builder.set(CaptureRequest.CONTROL_AWB_MODE, awb)
+            if (caps.supportsManualPostProcessing) {
+                runCatching {
+                    builder.set(
+                        CaptureRequest.COLOR_CORRECTION_MODE,
+                        CameraMetadata.COLOR_CORRECTION_MODE_HIGH_QUALITY
+                    )
+                }
+            }
         }
 
         // Stabilization (strictly only when supported by discovered hardware)
@@ -215,11 +235,14 @@ class ManualCameraController {
         }
 
         // Digital Zoom crop region (clearly flagged as digital zoom in UI)
+        val clampedZoom = controls.digitalZoomRatio.coerceIn(1f, caps.maxDigitalZoom)
+        if (android.os.Build.VERSION.SDK_INT >= android.os.Build.VERSION_CODES.R) {
+            runCatching { builder.set(CaptureRequest.CONTROL_ZOOM_RATIO, clampedZoom) }
+        }
         val active = caps.activeArraySize
-        if (active != null && controls.digitalZoomRatio > 1.01f) {
-            val z = controls.digitalZoomRatio.coerceIn(1f, caps.maxDigitalZoom)
-            val cropW = (active.width() / z).roundToInt()
-            val cropH = (active.height() / z).roundToInt()
+        if (active != null && clampedZoom > 1.01f) {
+            val cropW = (active.width() / clampedZoom).roundToInt()
+            val cropH = (active.height() / clampedZoom).roundToInt()
             val left = active.left + (active.width() - cropW) / 2
             val top = active.top + (active.height() - cropH) / 2
             builder.set(
@@ -277,21 +300,24 @@ class ManualCameraController {
         if (temp <= 66.0) {
             r = 255.0
             g = 99.4708025861 * kotlin.math.ln(temp) - 161.1195681661
-            b = if (temp <= 19.0) 0.0 else 138.5177312231 * kotlin.math.ln(temp - 10.0) - 305.0447927307
+            b = if (temp <= 19.0) 15.0 else 138.5177312231 * kotlin.math.ln(temp - 10.0) - 305.0447927307
         } else {
             r = 329.698727446 * (temp - 60.0).pow(-0.1332047592)
             g = 288.1221695283 * (temp - 60.0).pow(-0.0755148492)
             b = 255.0
         }
-        // Invert tint of blackbody illuminant to balance white
-        val rGain = (255.0 / r.coerceIn(40.0, 255.0)).toFloat() * 1.4f
-        val gGain = (255.0 / g.coerceIn(40.0, 255.0)).toFloat() * 1.0f
-        val bGain = (255.0 / b.coerceIn(40.0, 255.0)).toFloat() * 1.4f
+        val safeR = r.coerceIn(30.0, 255.0)
+        val safeG = g.coerceIn(30.0, 255.0)
+        val safeB = b.coerceIn(30.0, 255.0)
+        // Sensor native daylight baseline ~ (1.72R, 1.0G, 1.65B) modulated by inverted Planckian ratio
+        val rGain = ((safeG / safeR) * 1.72).toFloat()
+        val gGain = 1.0f
+        val bGain = ((safeG / safeB) * 1.65).toFloat()
         return RggbChannelVector(
-            rGain.coerceIn(0.6f, 4.0f),
-            gGain.coerceIn(0.6f, 2.0f),
-            gGain.coerceIn(0.6f, 2.0f),
-            bGain.coerceIn(0.6f, 4.0f)
+            rGain.coerceIn(0.75f, 3.8f),
+            gGain,
+            gGain,
+            bGain.coerceIn(0.75f, 3.8f)
         )
     }
 }

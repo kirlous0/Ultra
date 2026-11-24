@@ -109,11 +109,13 @@ fun DiagnosticsScreen(
                         Icon(Icons.Filled.Refresh, contentDescription = strings.rescanHardware, tint = SapphireTelemetry)
                     }
                     IconButton(onClick = {
-                        val send = Intent(Intent.ACTION_SEND).apply {
-                            type = "application/json"
-                            putExtra(Intent.EXTRA_TEXT, jsonReport)
+                        runCatching {
+                            val send = Intent(Intent.ACTION_SEND).apply {
+                                type = "application/json"
+                                putExtra(Intent.EXTRA_TEXT, jsonReport)
+                            }
+                            context.startActivity(Intent.createChooser(send, strings.shareReport))
                         }
-                        context.startActivity(Intent.createChooser(send, strings.shareReport))
                     }) {
                         Icon(Icons.Filled.Share, contentDescription = strings.shareReport, tint = TextPrimary)
                     }

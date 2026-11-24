@@ -57,15 +57,49 @@ class DetailEngine {
         val stagePx = IntArray(w * h)
         val outPx = IntArray(w * h)
 
+        // Quick strided scan to classify global scene illumination (Good Light vs Dim/Low Light)
+        var scanSum = 0L
+        var scanCount = 0L
+        val stepScan = (minOf(w, h) / 64).coerceAtLeast(4)
+        var syScan = 0
+        while (syScan < h) {
+            val row = syScan * w
+            var sxScan = 0
+            while (sxScan < w) {
+                scanSum += YuvUtils.luma(inPx[row + sxScan])
+                scanCount++
+                sxScan += stepScan
+            }
+            syScan += stepScan
+        }
+        val frameMeanLuma = scanSum.toFloat() / scanCount.coerceAtLeast(1L)
+        val isLowLightScene = frameMeanLuma < 86f
+        val isBrightDaylight = frameMeanLuma >= 102f
+
         val cx = w * 0.5f
         val cy = h * 0.5f
         val maxR = hypot(cx, cy).coerceAtLeast(1f)
         val invMaxR = 1f / maxR
-        val chromaBlend = config.chromaDenoiseStrength.coerceIn(0f, 0.85f)
-        val lumaBlend = config.lumaDenoiseStrength.coerceIn(0f, 0.75f)
+        val baseChromaBlend = config.chromaDenoiseStrength.coerceIn(0f, 0.85f)
+        val baseLumaBlend = config.lumaDenoiseStrength.coerceIn(0f, 0.75f)
         val patch = config.libPatcher
 
-        // Pass 1: Chromatic aberration + radial lens shading recovery + edge-preserving luma & chroma denoise
+        // In bright good light, lighten chroma/luma denoise so leaves, hair, and fine textures remain ultra-crisp;
+        // in low/bad light, engage strong opponent YCbCr chroma smoothing while preserving crisp luma edges.
+        val sceneChromaGain = when {
+            isLowLightScene -> 1.28f
+            isBrightDaylight -> 0.58f
+            else -> 0.92f
+        }
+        val sceneLumaGain = when {
+            isLowLightScene -> 1.15f
+            isBrightDaylight -> 0.42f
+            else -> 0.82f
+        }
+        val effectiveChromaW = (baseChromaBlend * sceneChromaGain).coerceIn(0f, 0.88f)
+        val effectiveLumaW = (baseLumaBlend * sceneLumaGain).coerceIn(0f, 0.75f)
+
+        // Pass 1: Lateral chromatic aberration + radial lens shading + opponent YCbCr edge-preserving denoise
         ParallelCompute.parallelRows(h, config.fullPower) { startY, endY ->
             for (y in startY until endY) {
                 val yM = (y - 1).coerceAtLeast(0)
@@ -102,54 +136,99 @@ class DetailEngine {
                         b = (b * gain).roundToInt().coerceIn(0, 255)
                     }
 
-                    // Edge-preserving chroma & flat-region luma denoise
-                    if (chromaBlend > 0.02f || lumaBlend > 0.02f) {
+                    // Edge-preserving opponent YCbCr chroma + texture-aware luma denoise
+                    if (effectiveChromaW > 0.02f || effectiveLumaW > 0.02f) {
                         val cLuma = (r * 77 + g * 150 + b * 29) shr 8
-                        var sumR = r * 2
-                        var sumG = g * 2
-                        var sumB = b * 2
-                        var cnt = 2
-                        val lumaThresh = if (cLuma < 64) 26 else 19
+                        val cCb = b - cLuma
+                        val cCr = r - cLuma
 
+                        // Measure local detail contrast; attenuate denoise on well-lit fine textures
                         val n0 = inPx[yM * w + x]
                         val n1 = inPx[yP * w + x]
                         val n2 = inPx[rowOff + xM]
                         val n3 = inPx[rowOff + xP]
-
                         val l0 = YuvUtils.luma(n0)
-                        if (abs(l0 - cLuma) < lumaThresh) {
-                            sumR += (n0 ushr 16) and 0xFF; sumG += (n0 ushr 8) and 0xFF; sumB += n0 and 0xFF; cnt++
-                        }
                         val l1 = YuvUtils.luma(n1)
-                        if (abs(l1 - cLuma) < lumaThresh) {
-                            sumR += (n1 ushr 16) and 0xFF; sumG += (n1 ushr 8) and 0xFF; sumB += n1 and 0xFF; cnt++
-                        }
                         val l2 = YuvUtils.luma(n2)
-                        if (abs(l2 - cLuma) < lumaThresh) {
-                            sumR += (n2 ushr 16) and 0xFF; sumG += (n2 ushr 8) and 0xFF; sumB += n2 and 0xFF; cnt++
-                        }
                         val l3 = YuvUtils.luma(n3)
-                        if (abs(l3 - cLuma) < lumaThresh) {
-                            sumR += (n3 ushr 16) and 0xFF; sumG += (n3 ushr 8) and 0xFF; sumB += n3 and 0xFF; cnt++
-                        }
+                        val localContrast = maxOf(abs(l0 - cLuma), abs(l1 - cLuma), abs(l2 - cLuma), abs(l3 - cLuma))
 
-                        if (cnt > 2) {
-                            val avgR = sumR / cnt
-                            val avgG = sumG / cnt
-                            val avgB = sumB / cnt
-                            val avgLuma = (avgR * 77 + avgG * 150 + avgB * 29) shr 8
-                            // Apply gentle luma denoise scaled down on edges and stronger in deep shadows
-                            val shadowBoost = if (cLuma < 72) 1.0f else 0.55f
-                            val keepLuma = 1f - (lumaBlend * shadowBoost * 0.65f).coerceIn(0f, 0.65f)
-                            val dL = ((cLuma - avgLuma) * keepLuma).roundToInt()
-                            val cleanR = (avgR + dL).coerceIn(0, 255)
-                            val cleanG = (avgG + dL).coerceIn(0, 255)
-                            val cleanB = (avgB + dL).coerceIn(0, 255)
-                            val blendW = maxOf(chromaBlend, lumaBlend * 0.65f)
-                            val inv = 1f - blendW
-                            r = (r * inv + cleanR * blendW).roundToInt().coerceIn(0, 255)
-                            g = (g * inv + cleanG * blendW).roundToInt().coerceIn(0, 255)
-                            b = (b * inv + cleanB * blendW).roundToInt().coerceIn(0, 255)
+                        // Skip Pass 1 smoothing completely on crisp well-lit detail edges
+                        if (!isBrightDaylight || cLuma < 85 || localContrast < 18) {
+                            val lumaThresh = when {
+                                cLuma < 52 -> 28
+                                isLowLightScene -> 24
+                                else -> 16
+                            }
+
+                            var sumY = cLuma * 2f
+                            var sumCb = cCb * 1.6f
+                            var sumCr = cCr * 1.6f
+                            var yW = 2f
+                            var cW = 1.6f
+
+                            val ns = intArrayOf(n0, n1, n2, n3)
+                            val ls = intArrayOf(l0, l1, l2, l3)
+                            for (k in 0..3) {
+                                val diff = abs(ls[k] - cLuma)
+                                if (diff < lumaThresh) {
+                                    val wY = 1f - diff / lumaThresh.toFloat()
+                                    val nr = (ns[k] ushr 16) and 0xFF
+                                    val nb = ns[k] and 0xFF
+                                    val nL = ls[k]
+                                    sumY += nL * wY
+                                    yW += wY
+                                    sumCb += (nb - nL)
+                                    sumCr += (nr - nL)
+                                    cW += 1f
+                                }
+                            }
+
+                            // Include 4 diagonal neighbors in dim shadows or Turbo mode for clean blotch-free night backgrounds
+                            if ((isLowLightScene && cLuma < 90) || (config.fullPower && cLuma < 64)) {
+                                val diag = intArrayOf(
+                                    inPx[yM * w + xM],
+                                    inPx[yM * w + xP],
+                                    inPx[yP * w + xM],
+                                    inPx[yP * w + xP]
+                                )
+                                for (dPx in diag) {
+                                    val dl = YuvUtils.luma(dPx)
+                                    val diff = abs(dl - cLuma)
+                                    if (diff < lumaThresh + 4) {
+                                        val nr = (dPx ushr 16) and 0xFF
+                                        val nb = dPx and 0xFF
+                                        sumY += dl * 0.65f
+                                        yW += 0.65f
+                                        sumCb += (nb - dl) * 0.8f
+                                        sumCr += (nr - dl) * 0.8f
+                                        cW += 0.8f
+                                    }
+                                }
+                            }
+
+                            if (cW > 1.7f) {
+                                val avgY = sumY / yW
+                                val avgCb = sumCb / cW
+                                val avgCr = sumCr / cW
+
+                                val shadowBoost = if (cLuma < 64) 1.0f else if (isBrightDaylight) 0.35f else 0.65f
+                                val texGuard = if (localContrast > 20 && !isLowLightScene) 0.35f else 1.0f
+                                val yMix = (effectiveLumaW * shadowBoost * texGuard * 0.55f).coerceIn(0f, 0.58f)
+                                val chMix = (effectiveChromaW * (if (cLuma < 72) 1.05f else 0.78f) * texGuard).coerceIn(0f, 0.85f)
+
+                                val outY = cLuma * (1f - yMix) + avgY * yMix
+                                val outCb = cCb * (1f - chMix) + avgCb * chMix
+                                val outCr = cCr * (1f - chMix) + avgCr * chMix
+
+                                // Exact inverse of Y = 0.299R + 0.587G + 0.114B with Cr=R-Y, Cb=B-Y
+                                val fr = (outY + outCr).roundToInt().coerceIn(0, 255)
+                                val fb = (outY + outCb).roundToInt().coerceIn(0, 255)
+                                val fg = (outY - 0.5093f * outCr - 0.1942f * outCb).roundToInt().coerceIn(0, 255)
+                                r = fr
+                                g = fg
+                                b = fb
+                            }
                         }
                     }
 
@@ -158,12 +237,12 @@ class DetailEngine {
             }
         }
 
-        // Pass 2: Two-scale Clarity + Halo-Clamped Micro-Detail + Filmic Highlight/Shadow + Fused Color Grading
-        val sharpW = config.sharpnessAmount.coerceIn(0f, 1.25f)
-        val clarityW = config.clarityAmount.coerceIn(0f, 0.85f)
+        // Pass 2: Adaptive Two-Scale Clarity + Halo-Clamped Micro-Detail + Filmic Dynamic Range + Fused Color Grading
+        val sharpW = (config.sharpnessAmount + if (isBrightDaylight) 0.04f else 0f).coerceIn(0f, 1.25f)
+        val clarityW = (config.clarityAmount + if (isBrightDaylight) 0.04f else 0f).coerceIn(0f, 0.85f)
         val vibW = config.vibranceBoost.coerceIn(0f, 0.65f)
-        val shadowLift = config.shadowLift.coerceIn(0f, 0.42f)
-        val highlightComp = config.highlightCompress.coerceIn(0f, 0.42f)
+        val shadowLift = (config.shadowLift + if (isLowLightScene) 0.04f else 0f).coerceIn(0f, 0.45f)
+        val highlightComp = (config.highlightCompress + if (isBrightDaylight) 0.03f else 0f).coerceIn(0f, 0.45f)
         val protectSkin = patch?.skinToneProtect ?: true
 
         ParallelCompute.parallelRows(h, config.fullPower) { startY, endY ->
@@ -214,21 +293,29 @@ class DetailEngine {
                     val isSkin = protectSkin && r0 > 95 && g0 > 40 && b0 > 20 &&
                         (r0 - g0) > 12 && r0 > b0 && abs(fineDetail) < 28
 
-                    val localSharp = if (isSkin) sharpW * 0.25f else sharpW
-                    val localClarity = if (isSkin) clarityW * 0.20f else clarityW
+                    val shadowSharpGuard = when {
+                        lumaC < 38 -> 0.45f
+                        lumaC < 64 && isLowLightScene -> 0.65f
+                        else -> 1.0f
+                    }
+                    val baseGate = if (isBrightDaylight) 2 else if (isLowLightScene) 5 else 3
+                    val noiseGate = (baseGate + (effectiveLumaW * 8f).roundToInt()).coerceIn(2, 11)
+                    val localSharp = (if (isSkin) sharpW * 0.25f else sharpW) * shadowSharpGuard
+                    val localClarity = (if (isSkin) clarityW * 0.20f else clarityW) * (if (lumaC < 36) 0.70f else 1.0f)
 
-                    val fineDelta = if (abs(fineDetail) > 3) {
-                        (fineDetail * localSharp).roundToInt().coerceIn(-30, 30)
+                    val fineDelta = if (abs(fineDetail) > noiseGate) {
+                        val excess = if (fineDetail > 0) fineDetail - noiseGate else fineDetail + noiseGate
+                        (excess * localSharp).roundToInt().coerceIn(-28, 28)
                     } else 0
-                    val clarityDelta = if (abs(clarityDetail) > 5) {
+                    val clarityDelta = if (abs(clarityDetail) > (noiseGate + 2)) {
                         (clarityDetail * localClarity).roundToInt().coerceIn(-20, 20)
                     } else 0
 
                     // Dynamic-range gentle tone shaping (shadow recovery + highlight protection)
                     val normL = lumaC / 255f
-                    val shadowBoost = ((1f - normL) * (1f - normL)) * shadowLift * 30f
-                    val highPull = if (normL > 0.70f) {
-                        ((normL - 0.70f) / 0.30f) * highlightComp * 28f
+                    val shadowBoost = ((1f - normL) * (1f - normL)) * shadowLift * 36f
+                    val highPull = if (normL > 0.68f) {
+                        ((normL - 0.68f) / 0.32f) * highlightComp * 32f
                     } else 0f
 
                     val totalDelta = fineDelta + clarityDelta + (shadowBoost - highPull).roundToInt()

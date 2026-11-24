@@ -47,6 +47,26 @@ class UltraCamEngineTest {
         return bmp
     }
 
+    private fun makeSubpixelPatternBitmap(w: Int, h: Int, shiftX: Float, shiftY: Float): Bitmap {
+        val bmp = Bitmap.createBitmap(w, h, Bitmap.Config.ARGB_8888)
+        for (y in 0 until h) {
+            val sy = y.toDouble() - shiftY
+            for (x in 0 until w) {
+                val sx = x.toDouble() - shiftX
+                val wave = 128.0 +
+                    55.0 * kotlin.math.sin(sx * 0.42 + sy * 0.19) +
+                    45.0 * kotlin.math.cos(sy * 0.37 - sx * 0.23) +
+                    20.0 * kotlin.math.sin((sx + sy) * 0.71)
+                val v = wave.toInt().coerceIn(0, 255)
+                val r = (v * 1.0f).toInt().coerceIn(0, 255)
+                val g = (v * 0.92f).toInt().coerceIn(0, 255)
+                val b = (v * 0.85f).toInt().coerceIn(0, 255)
+                bmp.setPixel(x, y, Color.rgb(r, g, b))
+            }
+        }
+        return bmp
+    }
+
     @Test
     fun `alignment detects static vs shifted frames accurately`() {
         val f1 = makePatternBitmap(96, 72, shiftX = 0)
@@ -236,5 +256,70 @@ class UltraCamEngineTest {
         assertFalse(en.isArabic)
         assertEquals("ألترا كام", ar.appTitle)
         assertEquals("UltraCam", en.appTitle)
+    }
+
+    @Test
+    fun `viewfinder fitted size preserves true 1x aspect ratio for photo and video`() {
+        val (photoW, photoH) = com.example.camera.computeFittedViewfinderSize(
+            containerW = 1080f,
+            containerH = 2400f,
+            previewSize = Size(1440, 1080)
+        )
+        assertEquals(1080f, photoW, 0.5f)
+        assertEquals(1440f, photoH, 0.5f)
+
+        val (videoW, videoH) = com.example.camera.computeFittedViewfinderSize(
+            containerW = 1080f,
+            containerH = 2400f,
+            previewSize = Size(1920, 1080)
+        )
+        assertEquals(1080f, videoW, 0.5f)
+        assertEquals(1920f, videoH, 0.5f)
+
+        val (landW, landH) = com.example.camera.computeFittedViewfinderSize(
+            containerW = 2400f,
+            containerH = 1080f,
+            previewSize = Size(1920, 1080)
+        )
+        assertEquals(1920f, landW, 0.5f)
+        assertEquals(1080f, landH, 0.5f)
+    }
+
+    @Test
+    fun `super resolution upscales subpixel-shifted frames within 3600px bound`() {
+        val frames = listOf(
+            makeSubpixelPatternBitmap(128, 96, 0f, 0f),
+            makeSubpixelPatternBitmap(128, 96, 1.5f, 0.5f),
+            makeSubpixelPatternBitmap(128, 96, -0.5f, 1.5f)
+        )
+        val res = SuperResolutionProcessor().processSuperResolution(frames, fullPower = false)
+        assertTrue("Expected true super-res on subpixel shifts: ${res.statusReason}", res.isTrueSuperResolution)
+        assertTrue("Expected scaleFactor >= 1.25f, got ${res.scaleFactor}", res.scaleFactor >= 1.25f)
+        assertTrue(res.bitmap.width > 128 && res.bitmap.width <= 3600)
+        assertTrue(res.bitmap.height > 96 && res.bitmap.height <= 3600)
+        frames.forEach { it.recycle() }
+        res.bitmap.recycle()
+    }
+
+    @Test
+    fun `detail engine preserves dimensions across bright daylight and dim chroma scenes`() {
+        val bright = makePatternBitmap(80, 60, brightScale = 1.25f)
+        val brightOut = DetailEngine().enhanceDetails(bright, sharpnessAmount = 0.45f)
+        assertEquals(80, brightOut.width)
+        assertEquals(60, brightOut.height)
+
+        val dim = makePatternBitmap(80, 60, brightScale = 0.25f)
+        val dimOut = DetailEngine().enhanceDetails(dim, sharpnessAmount = 0.35f)
+        assertEquals(80, dimOut.width)
+        assertEquals(60, dimOut.height)
+
+        var brightDiff = 0L
+        for (x in 1 until 79) {
+            brightDiff += kotlin.math.abs(Color.red(brightOut.getPixel(x, 30)) - Color.red(brightOut.getPixel(x - 1, 30)))
+        }
+        assertTrue(brightDiff > 0L)
+
+        bright.recycle(); brightOut.recycle()
+        dim.recycle(); dimOut.recycle()
     }
 }

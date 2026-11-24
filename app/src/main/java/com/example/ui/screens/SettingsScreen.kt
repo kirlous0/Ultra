@@ -26,7 +26,9 @@ import androidx.compose.material.icons.Icons
 import androidx.compose.material.icons.automirrored.filled.ArrowBack
 import androidx.compose.material.icons.filled.AutoAwesome
 import androidx.compose.material.icons.filled.BrandingWatermark
+import androidx.compose.material.icons.filled.CameraAlt
 import androidx.compose.material.icons.filled.Folder
+import androidx.compose.material.icons.filled.GridOn
 import androidx.compose.material.icons.filled.Language
 import androidx.compose.material.icons.filled.MonitorHeart
 import androidx.compose.material.icons.filled.Tune
@@ -64,6 +66,10 @@ import com.example.camera.AntiBandingOption
 import com.example.camera.AppDestination
 import com.example.camera.FocusPeakingColor
 import com.example.camera.FocusPeakingSensitivity
+import com.example.camera.GridLineColor
+import com.example.camera.GridLineThickness
+import com.example.camera.GridOverlayType
+import com.example.camera.ProcessingDetailPreset
 import com.example.system.AppLanguage
 import com.example.system.AppStrings
 import com.example.ui.MainViewModel
@@ -256,6 +262,80 @@ fun SettingsScreen(
                     checked = settings.showLiveColorBar,
                     onCheckedChange = { scope.launch { viewModel.settingsManager.setShowLiveColorBar(it) } }
                 )
+                SettingSwitchRow(
+                    label = strings.lowLightAiBoostLabel,
+                    subtitle = strings.lowLightAiBoostDesc,
+                    checked = settings.lowLightAiBoost,
+                    switchTestTag = "settings_low_light_boost_switch",
+                    onCheckedChange = { scope.launch { viewModel.settingsManager.setLowLightAiBoost(it) } }
+                )
+                Text("${strings.lowLightMaxIsoLabel}: ISO ${settings.lowLightTargetMaxIso}", style = MaterialTheme.typography.labelSmall, color = TextSecondary)
+                Row(
+                    modifier = Modifier.horizontalScroll(rememberScrollState()),
+                    horizontalArrangement = Arrangement.spacedBy(8.dp)
+                ) {
+                    listOf(800, 1600, 3200, 6400).forEach { isoCap ->
+                        ProPillButton(
+                            label = "ISO $isoCap",
+                            selected = settings.lowLightTargetMaxIso == isoCap,
+                            activeColor = SapphireTelemetry,
+                            testTag = "settings_low_light_iso_$isoCap",
+                            onClick = { scope.launch { viewModel.settingsManager.setLowLightTuning(maxIso = isoCap) } }
+                        )
+                    }
+                }
+                val nightEvFormatted = settings.lowLightEvBiasSteps * 0.3f
+                Text(
+                    text = "${strings.lowLightEvBiasLabel}: ${if (nightEvFormatted >= 0f) "+" else ""}${"%.1f".format(nightEvFormatted)} EV",
+                    style = MaterialTheme.typography.labelSmall,
+                    color = TextSecondary
+                )
+                Slider(
+                    value = settings.lowLightEvBiasSteps.toFloat(),
+                    onValueChange = { s ->
+                        scope.launch { viewModel.settingsManager.setLowLightTuning(evBiasSteps = s.roundToInt()) }
+                    },
+                    valueRange = -3f..6f,
+                    colors = SliderDefaults.colors(thumbColor = SapphireTelemetry, activeTrackColor = SapphireTelemetry),
+                    modifier = Modifier.testTag("settings_low_light_ev_slider")
+                )
+                Text(strings.processingDetailPresetLabel, style = MaterialTheme.typography.labelSmall, color = TextSecondary)
+                Row(
+                    modifier = Modifier.horizontalScroll(rememberScrollState()),
+                    horizontalArrangement = Arrangement.spacedBy(8.dp)
+                ) {
+                    ProcessingDetailPreset.entries.forEach { preset ->
+                        ProPillButton(
+                            label = if (strings.isArabic) preset.labelAr else preset.labelEn,
+                            selected = settings.processingDetailPreset == preset,
+                            testTag = "settings_detail_preset_${preset.name.lowercase()}",
+                            onClick = {
+                                scope.launch { viewModel.settingsManager.setProcessingDetailPreset(preset) }
+                            }
+                        )
+                    }
+                }
+                Text(strings.hdrFramesCountLabel, style = MaterialTheme.typography.labelSmall, color = TextSecondary)
+                Row(horizontalArrangement = Arrangement.spacedBy(8.dp)) {
+                    ProPillButton(
+                        label = "3F",
+                        selected = settings.hdrFrameCount < 5,
+                        testTag = "settings_hdr_3f_pill",
+                        onClick = { scope.launch { viewModel.settingsManager.setHdrOptions(frameCount = 3) } }
+                    )
+                    ProPillButton(
+                        label = "5F",
+                        selected = settings.hdrFrameCount >= 5,
+                        testTag = "settings_hdr_5f_pill",
+                        onClick = { scope.launch { viewModel.settingsManager.setHdrOptions(frameCount = 5) } }
+                    )
+                }
+                SettingSwitchRow(
+                    label = strings.hdrGhostRejectionLabel,
+                    checked = settings.hdrGhostRejection,
+                    switchTestTag = "settings_hdr_ghost_switch",
+                    onCheckedChange = { scope.launch { viewModel.settingsManager.setHdrOptions(ghostRejection = it) } }
+                )
                 Text("${strings.jpegQualityLabel}: ${settings.defaultJpegQuality}%", color = TextSecondary)
                 Slider(
                     value = settings.defaultJpegQuality.toFloat(),
@@ -264,6 +344,153 @@ fun SettingsScreen(
                     },
                     valueRange = 60f..100f,
                     colors = SliderDefaults.colors(thumbColor = AmberFocus, activeTrackColor = AmberFocus)
+                )
+            }
+
+            // Viewfinder Grids & HUD Overlays
+            SettingCard(title = strings.viewfinderOverlaysTitle, icon = Icons.Filled.GridOn) {
+                SettingSwitchRow(
+                    label = strings.gridLabel,
+                    subtitle = strings.gridOverlayToggleDesc,
+                    checked = settings.gridOverlay != GridOverlayType.NONE,
+                    switchTestTag = "settings_grid_master_switch",
+                    onCheckedChange = {
+                        scope.launch { viewModel.settingsManager.toggleGridOverlayEnabled(it) }
+                    }
+                )
+                Row(
+                    modifier = Modifier.horizontalScroll(rememberScrollState()),
+                    horizontalArrangement = Arrangement.spacedBy(8.dp)
+                ) {
+                    GridOverlayType.entries.forEach { grid ->
+                        ProPillButton(
+                            label = if (strings.isArabic) grid.labelAr else grid.labelEn,
+                            selected = settings.gridOverlay == grid,
+                            testTag = "settings_grid_type_${grid.name.lowercase()}",
+                            onClick = {
+                                scope.launch { viewModel.settingsManager.setGridOverlay(grid) }
+                            }
+                        )
+                    }
+                }
+                if (settings.gridOverlay != GridOverlayType.NONE) {
+                    Text(
+                        text = "${strings.gridOpacityLabel}: ${(settings.gridOpacity * 100).roundToInt()}%",
+                        style = MaterialTheme.typography.labelSmall,
+                        color = TextSecondary
+                    )
+                    Slider(
+                        value = settings.gridOpacity,
+                        onValueChange = { a ->
+                            scope.launch { viewModel.settingsManager.setGridConfig(opacity = a) }
+                        },
+                        valueRange = 0.20f..0.95f,
+                        colors = SliderDefaults.colors(thumbColor = AmberFocus, activeTrackColor = AmberFocus),
+                        modifier = Modifier.testTag("settings_grid_opacity_slider")
+                    )
+                    Text(strings.gridThicknessLabel, style = MaterialTheme.typography.labelSmall, color = TextSecondary)
+                    Row(
+                        modifier = Modifier.horizontalScroll(rememberScrollState()),
+                        horizontalArrangement = Arrangement.spacedBy(8.dp)
+                    ) {
+                        GridLineThickness.entries.forEach { t ->
+                            ProPillButton(
+                                label = if (strings.isArabic) t.labelAr else t.labelEn,
+                                selected = settings.gridThickness == t,
+                                testTag = "settings_grid_thickness_${t.name.lowercase()}",
+                                onClick = {
+                                    scope.launch { viewModel.settingsManager.setGridConfig(thickness = t) }
+                                }
+                            )
+                        }
+                    }
+                    Text(strings.gridColorLabel, style = MaterialTheme.typography.labelSmall, color = TextSecondary)
+                    Row(
+                        modifier = Modifier.horizontalScroll(rememberScrollState()),
+                        horizontalArrangement = Arrangement.spacedBy(8.dp)
+                    ) {
+                        GridLineColor.entries.forEach { c ->
+                            ProPillButton(
+                                label = if (strings.isArabic) c.labelAr else c.labelEn,
+                                selected = settings.gridColor == c,
+                                activeColor = Color(c.argb),
+                                testTag = "settings_grid_color_${c.name.lowercase()}",
+                                onClick = {
+                                    scope.launch { viewModel.settingsManager.setGridConfig(color = c) }
+                                }
+                            )
+                        }
+                    }
+                    if (settings.gridOverlay == GridOverlayType.RULE_OF_THIRDS) {
+                        SettingSwitchRow(
+                            label = strings.gridDiagonalsLabel,
+                            checked = settings.gridShowDiagonals,
+                            switchTestTag = "settings_grid_diagonals_switch",
+                            onCheckedChange = {
+                                scope.launch { viewModel.settingsManager.setGridConfig(showDiagonals = it) }
+                            }
+                        )
+                        SettingSwitchRow(
+                            label = strings.gridIntersectionDotsLabel,
+                            checked = settings.gridShowIntersectionDots,
+                            switchTestTag = "settings_grid_points_switch",
+                            onCheckedChange = {
+                                scope.launch { viewModel.settingsManager.setGridConfig(showIntersectionDots = it) }
+                            }
+                        )
+                    }
+                }
+                SettingSwitchRow(
+                    label = strings.histogramLabel,
+                    checked = settings.showHistogram,
+                    switchTestTag = "settings_histogram_switch",
+                    onCheckedChange = {
+                        scope.launch { viewModel.settingsManager.setOverlays(showHistogram = it) }
+                    }
+                )
+                SettingSwitchRow(
+                    label = strings.rgbHistogram,
+                    checked = settings.showRgbHistogram,
+                    switchTestTag = "settings_rgb_histogram_switch",
+                    onCheckedChange = {
+                        scope.launch { viewModel.settingsManager.setOverlays(showRgbHistogram = it) }
+                    }
+                )
+                SettingSwitchRow(
+                    label = strings.zebraLabel,
+                    checked = settings.zebraWarningsEnabled,
+                    switchTestTag = "settings_zebra_switch",
+                    onCheckedChange = {
+                        scope.launch { viewModel.settingsManager.setOverlays(zebraWarnings = it) }
+                    }
+                )
+                SettingSwitchRow(
+                    label = strings.digitalLevel,
+                    checked = settings.showDigitalLevel,
+                    switchTestTag = "settings_digital_level_switch",
+                    onCheckedChange = {
+                        scope.launch { viewModel.settingsManager.setOverlays(showDigitalLevel = it) }
+                    }
+                )
+            }
+
+            // Capture & Lens Controls
+            SettingCard(title = strings.captureControlsTitle, icon = Icons.Filled.CameraAlt) {
+                SettingSwitchRow(
+                    label = strings.mirrorFrontCameraLabel,
+                    checked = settings.mirrorFrontCamera,
+                    switchTestTag = "settings_mirror_front_switch",
+                    onCheckedChange = {
+                        scope.launch { viewModel.settingsManager.setMirrorFrontCamera(it) }
+                    }
+                )
+                SettingSwitchRow(
+                    label = strings.hapticShutterLabel,
+                    checked = settings.hapticShutterFeedback,
+                    switchTestTag = "settings_haptic_shutter_switch",
+                    onCheckedChange = {
+                        scope.launch { viewModel.settingsManager.setHapticShutterFeedback(it) }
+                    }
                 )
             }
 

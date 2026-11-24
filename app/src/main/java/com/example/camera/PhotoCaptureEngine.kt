@@ -28,16 +28,64 @@ import kotlinx.coroutines.Dispatchers
 import kotlinx.coroutines.async
 import kotlinx.coroutines.awaitAll
 import kotlinx.coroutines.coroutineScope
+import kotlinx.coroutines.delay
 import kotlinx.coroutines.withContext
 import kotlinx.coroutines.withTimeoutOrNull
 import java.io.ByteArrayOutputStream
 import java.util.Locale
 import java.util.concurrent.ConcurrentLinkedQueue
+import kotlin.math.pow
+import kotlin.math.roundToInt
 
 data class PhotoCaptureOutcome(
     val savedResults: List<SavedMediaResult>,
     val statusWarning: String? = null,
     val detailInfo: String? = null
+)
+
+data class AcquiredSingleJpeg(
+    val captureResult: TotalCaptureResult,
+    val jpegBytes: ByteArray,
+    val previewThumb: Bitmap?,
+    val halOrientationDeg: Int,
+    val caps: CameraDeviceCapabilities,
+    val controls: ProControlsState,
+    val settings: UltraCamSettings,
+    val location: Location?,
+    val modeTag: String,
+    val applyPortraitBokeh: Boolean,
+    val detectedFaces: List<RectF>,
+    val applyDocScanner: Boolean,
+    val aiProfile: AiProcessingProfile?,
+    val focusPowerMode: Boolean,
+    val liveShadowBias: Float,
+    val liveHighlightBias: Float,
+    val aiSceneName: String?,
+    val tapMetered: Boolean,
+    val mirrorFront: Boolean,
+    val initialStage: BackgroundProcessingStage
+)
+
+data class AcquiredMultiFrameBurst(
+    val frames: List<Pair<TotalCaptureResult?, ByteArray>>,
+    val previewThumb: Bitmap?,
+    val mode: AppDestination,
+    val superResEnabled: Boolean,
+    val astroMode: Boolean,
+    val caps: CameraDeviceCapabilities,
+    val controls: ProControlsState,
+    val settings: UltraCamSettings,
+    val location: Location?,
+    val aiProfile: AiProcessingProfile?,
+    val focusPowerMode: Boolean,
+    val liveShadowBias: Float,
+    val liveHighlightBias: Float,
+    val aiSceneName: String?,
+    val tapMetered: Boolean,
+    val mirrorFront: Boolean,
+    val liveExposureNs: Long,
+    val liveIso: Int,
+    val initialStage: BackgroundProcessingStage
 )
 
 class PhotoCaptureEngine(
@@ -48,6 +96,87 @@ class PhotoCaptureEngine(
     private val compEngine: ComputationalPhotographyEngine,
     private val storageManager: StorageManager
 ) {
+    companion object {
+        /**
+         * Computes true per-frame sensor exposure/ISO brackets for HDR+ multi-frame capture.
+         * Keeps negative EV fast (underexposed highlights preserved) and limits handheld +EV
+         * shutter time to 66ms while scaling ISO cleanly within sensor limits.
+         */
+        fun computeHdrBracketExposures(
+            baseExposureNs: Long,
+            baseIso: Int,
+            stepsCount: Int,
+            exposureRange: LongRange?,
+            isoRange: IntRange?
+        ): List<Pair<Long, Int>> {
+            val safeExp = baseExposureNs.coerceAtLeast(100_000L)
+            val safeIso = baseIso.coerceAtLeast(50)
+            val minExp = exposureRange?.first ?: 50_000L
+            val maxExp = exposureRange?.last ?: 1_000_000_000L
+            val minIso = isoRange?.first ?: 50
+            val maxIso = isoRange?.last ?: 3200
+            val handheldCapNs = minOf(maxExp, 66_000_000L).coerceAtLeast(minExp)
+
+            val evOffsets = if (stepsCount >= 5) {
+                listOf(-2.0f, -1.0f, 0f, 1.0f, 1.8f)
+            } else {
+                listOf(-1.7f, 0f, 1.5f)
+            }
+
+            return evOffsets.map { ev ->
+                if (ev == 0f) {
+                    safeExp.coerceIn(minExp, maxExp) to safeIso.coerceIn(minIso, maxIso)
+                } else {
+                    val mult = 2.0.pow(ev.toDouble())
+                    val targetTotal = safeExp.toDouble() * safeIso.toDouble() * mult
+                    val expCap = if (ev > 0f) maxOf(safeExp, handheldCapNs) else maxExp
+                    val rawExp = (safeExp.toDouble() * mult).toLong()
+                    val clampedExp = rawExp.coerceIn(minExp, expCap)
+                    val remainingIso = (targetTotal / clampedExp.toDouble()).roundToInt()
+                    val clampedIso = remainingIso.coerceIn(minIso, maxIso)
+                    clampedExp to clampedIso
+                }
+            }
+        }
+
+        /**
+         * Computes boosted handheld Night or Astro exposure/ISO targets from live AE telemetry.
+         */
+        fun computeNightFrameExposure(
+            baseExposureNs: Long,
+            baseIso: Int,
+            astroMode: Boolean,
+            exposureRange: LongRange?,
+            isoRange: IntRange?,
+            targetMaxIso: Int = 1600,
+            evBiasSteps: Int = 0,
+            aeCompensationStep: Float = 0.1f
+        ): Pair<Long, Int> {
+            val safeExp = baseExposureNs.coerceAtLeast(1_000_000L)
+            val safeIso = baseIso.coerceAtLeast(50)
+            val minExp = exposureRange?.first ?: 100_000L
+            val maxExp = exposureRange?.last ?: 1_000_000_000L
+            val minIso = isoRange?.first ?: 50
+            val maxIso = isoRange?.last ?: 3200
+
+            val evGain = 2.0.pow((evBiasSteps * aeCompensationStep).coerceIn(-2.0f, 2.5f).toDouble())
+            val desiredExp = if (astroMode) {
+                maxOf((safeExp * 2.0 * evGain).toLong(), 220_000_000L).coerceAtMost(450_000_000L)
+            } else {
+                maxOf((safeExp * 1.65 * evGain).toLong(), 75_000_000L).coerceAtMost(135_000_000L)
+            }.coerceIn(minExp, maxExp)
+
+            val isoCap = if (astroMode) {
+                maxIso
+            } else {
+                minOf(maxIso, targetMaxIso.coerceAtLeast(400)).coerceAtLeast(minIso)
+            }
+            val desiredIso = (safeIso * (if (astroMode) 1.55 else 1.25) * kotlin.math.sqrt(evGain))
+                .roundToInt()
+                .coerceIn(minIso, isoCap)
+            return desiredExp to desiredIso
+        }
+    }
 
     fun computeJpegOrientation(caps: CameraDeviceCapabilities, deviceRotationDeg: Int): Int {
         val isFront = caps.facing == android.hardware.camera2.CameraCharacteristics.LENS_FACING_FRONT
@@ -56,6 +185,218 @@ class PhotoCaptureEngine(
         } else {
             (caps.sensorOrientation + deviceRotationDeg) % 360
         }
+    }
+
+    suspend fun acquireSingleJpeg(
+        caps: CameraDeviceCapabilities,
+        controls: ProControlsState,
+        jpegReader: ImageReader,
+        previewSurface: Surface?,
+        jpegQueue: ConcurrentLinkedQueue<Pair<Long, ByteArray>>,
+        deviceRotationDeg: Int,
+        settings: UltraCamSettings,
+        location: Location?,
+        modeTag: String = "PHOTO",
+        applyPortraitBokeh: Boolean = false,
+        detectedFaces: List<RectF> = emptyList(),
+        applyDocScanner: Boolean = false,
+        aiProfile: AiProcessingProfile? = null,
+        focusPowerMode: Boolean = false,
+        liveShadowBias: Float = 0f,
+        liveHighlightBias: Float = 0f,
+        aiSceneName: String? = null,
+        tapMetered: Boolean = false,
+        aiAutoWb: WhiteBalancePreset? = null
+    ): Result<AcquiredSingleJpeg> {
+        val device = sessionManager.cameraDevice
+            ?: return Result.failure(IllegalStateException("Camera not ready"))
+        val builder = device.createCaptureRequest(CameraDevice.TEMPLATE_STILL_CAPTURE)
+        builder.addTarget(jpegReader.surface)
+        if (previewSurface != null && previewSurface.isValid) {
+            builder.addTarget(previewSurface)
+        }
+        manualController.applyToBuilder(
+            builder = builder,
+            caps = caps,
+            controls = controls,
+            isVideoMode = false,
+            eisEnabled = false,
+            aiProfile = aiProfile,
+            focusPowerMode = focusPowerMode,
+            aiAutoWb = aiAutoWb
+        )
+        val outJpegQuality = if (focusPowerMode) maxOf(controls.jpegQuality, 98) else controls.jpegQuality
+        builder.set(CaptureRequest.JPEG_QUALITY, outJpegQuality.toByte())
+        builder.set(CaptureRequest.JPEG_ORIENTATION, computeJpegOrientation(caps, deviceRotationDeg))
+
+        jpegQueue.clear()
+        val result = sessionManager.captureSingle(builder).getOrElse {
+            return Result.failure(it)
+        }
+        val ts = result.get(TotalCaptureResult.SENSOR_TIMESTAMP) ?: 0L
+        val jpegBytes = awaitJpegBytes(jpegQueue, ts)
+            ?: return Result.failure(IllegalStateException("Timed out waiting for JPEG buffer"))
+
+        val halOrientationDeg = ExifProcessor.readJpegOrientationDegrees(jpegBytes)
+        val mirrorFront = caps.lensRole == LensRole.FRONT && settings.mirrorFrontCamera
+        val previewThumb = decodePreviewThumb(jpegBytes, halOrientationDeg, mirrorFront)
+
+        return Result.success(
+            AcquiredSingleJpeg(
+                captureResult = result,
+                jpegBytes = jpegBytes,
+                previewThumb = previewThumb,
+                halOrientationDeg = halOrientationDeg,
+                caps = caps,
+                controls = controls,
+                settings = settings,
+                location = location,
+                modeTag = modeTag,
+                applyPortraitBokeh = applyPortraitBokeh,
+                detectedFaces = detectedFaces,
+                applyDocScanner = applyDocScanner,
+                aiProfile = aiProfile,
+                focusPowerMode = focusPowerMode,
+                liveShadowBias = liveShadowBias,
+                liveHighlightBias = liveHighlightBias,
+                aiSceneName = aiSceneName,
+                tapMetered = tapMetered,
+                mirrorFront = mirrorFront,
+                initialStage = BackgroundProcessingStage.ENHANCING
+            )
+        )
+    }
+
+    suspend fun processAcquiredSingleJpeg(
+        acquired: AcquiredSingleJpeg,
+        onStageUpdate: (BackgroundProcessingStage, Float) -> Unit = { _, _ -> }
+    ): PhotoCaptureOutcome = withContext(Dispatchers.Default) {
+        val settings = acquired.settings
+        val caps = acquired.caps
+        val controls = acquired.controls
+        val focusPowerMode = acquired.focusPowerMode
+        val jpegBytes = acquired.jpegBytes
+        val result = acquired.captureResult
+        val outJpegQuality = if (focusPowerMode) maxOf(controls.jpegQuality, 98) else controls.jpegQuality
+
+        var finalBytes = jpegBytes
+        var warning: String? = null
+        var outWidth = 0
+        var outHeight = 0
+        var outExifOrientation = ExifInterface.ORIENTATION_NORMAL
+
+        val halOrientationDeg = acquired.halOrientationDeg
+        val shouldRefine = acquired.applyPortraitBokeh ||
+            acquired.applyDocScanner ||
+            settings.watermarkEnabled ||
+            settings.aiAssistantEnabled ||
+            focusPowerMode ||
+            !controls.isManualMode ||
+            acquired.mirrorFront ||
+            settings.processingDetailPreset != ProcessingDetailPreset.BALANCED ||
+            settings.libPatcher.colorProfile != com.example.processing.CameraColorProfile.NATURAL_TRUE
+
+        if (shouldRefine) {
+            onStageUpdate(BackgroundProcessingStage.ENHANCING, 0.40f)
+            val decodeMaxDim = if (focusPowerMode) 4096 else 3264
+            val rawBmp = YuvUtils.decodeJpegDownsampled(jpegBytes, maxDim = decodeMaxDim)
+            var upright = YuvUtils.rotateBitmapIfNeeded(rawBmp, halOrientationDeg)
+            if (acquired.mirrorFront) {
+                val mirrored = YuvUtils.mirrorBitmapHorizontal(upright)
+                if (mirrored !== upright) upright.recycle()
+                upright = mirrored
+            }
+            var processed = when {
+                acquired.applyDocScanner -> compEngine.documentScannerEngine.scanDocument(upright)
+                acquired.applyPortraitBokeh -> compEngine.processPortrait(
+                    src = upright,
+                    facesNormalized = acquired.detectedFaces,
+                    aiProfile = acquired.aiProfile,
+                    fullPower = focusPowerMode,
+                    libPatcher = settings.libPatcher,
+                    liveShadowBias = acquired.liveShadowBias,
+                    liveHighlightBias = acquired.liveHighlightBias,
+                    detailPreset = settings.processingDetailPreset,
+                    lowLightAiBoost = settings.lowLightAiBoost
+                )
+                else -> {
+                    val assessed = compEngine.refineStandardPhoto(
+                        src = upright,
+                        aiProfile = acquired.aiProfile,
+                        fullPower = focusPowerMode,
+                        libPatcher = settings.libPatcher,
+                        liveShadowBias = acquired.liveShadowBias,
+                        liveHighlightBias = acquired.liveHighlightBias,
+                        detailPreset = settings.processingDetailPreset,
+                        lowLightAiBoost = settings.lowLightAiBoost
+                    )
+                    if (assessed.isUnstableOrBlurred) warning = "unstable"
+                    assessed.processedBitmap
+                }
+            }
+            if (settings.watermarkEnabled) {
+                val shotIso = result.get(TotalCaptureResult.SENSOR_SENSITIVITY) ?: controls.iso
+                val shotExp = result.get(TotalCaptureResult.SENSOR_EXPOSURE_TIME) ?: controls.exposureTimeNs
+                val shotAp = caps.apertures.firstOrNull() ?: 1.8f
+                val stamped = stampWatermark(
+                    src = processed,
+                    text = settings.watermarkText,
+                    style = settings.watermarkStyle,
+                    exifLine = formatExifBadge(shotAp, shotExp, shotIso, settings.libPatcher.colorProfile.badge)
+                )
+                if (stamped !== processed) processed.recycle()
+                processed = stamped
+            }
+            outWidth = processed.width
+            outHeight = processed.height
+            outExifOrientation = ExifInterface.ORIENTATION_NORMAL
+            onStageUpdate(BackgroundProcessingStage.SAVING, 0.85f)
+            finalBytes = encodeBitmapJpeg(processed, outJpegQuality)
+            if (processed !== upright) processed.recycle()
+            upright.recycle()
+        } else {
+            onStageUpdate(BackgroundProcessingStage.SAVING, 0.85f)
+            val bounds = BitmapFactory.Options().apply { inJustDecodeBounds = true }
+            BitmapFactory.decodeByteArray(jpegBytes, 0, jpegBytes.size, bounds)
+            outWidth = bounds.outWidth
+            outHeight = bounds.outHeight
+            outExifOrientation = when (halOrientationDeg) {
+                90 -> ExifInterface.ORIENTATION_ROTATE_90
+                180 -> ExifInterface.ORIENTATION_ROTATE_180
+                270 -> ExifInterface.ORIENTATION_ROTATE_270
+                else -> ExifInterface.ORIENTATION_NORMAL
+            }
+        }
+
+        val exifPayload = ExifProcessor.buildPayload(
+            caps = caps,
+            controls = controls,
+            settings = settings,
+            captureResult = result,
+            modeTag = acquired.modeTag,
+            frameCount = 1,
+            focusPowerMode = focusPowerMode,
+            aiSceneName = acquired.aiSceneName,
+            imageWidth = outWidth,
+            imageHeight = outHeight,
+            exifOrientation = outExifOrientation,
+            location = acquired.location,
+            tapMetered = acquired.tapMetered
+        )
+        finalBytes = ExifProcessor.injectJpegExifBytes(
+            context = context,
+            jpegBytes = finalBytes,
+            payload = exifPayload,
+            sourceHalJpegBytes = jpegBytes
+        )
+
+        val name = storageManager.buildUniqueFilename(settings.filenamePrefix, acquired.modeTag, "jpg")
+        val saved = storageManager.savePhotoBytes(finalBytes, name, "image/jpeg", settings, acquired.location)
+        val infoTag = buildString {
+            append(settings.libPatcher.colorProfile.badge)
+            if (focusPowerMode) append(" · TURBO 100%")
+        }
+        PhotoCaptureOutcome(listOfNotNull(saved), statusWarning = warning, detailInfo = infoTag)
     }
 
     suspend fun captureSingleJpeg(
@@ -78,135 +419,31 @@ class PhotoCaptureEngine(
         tapMetered: Boolean = false,
         aiAutoWb: WhiteBalancePreset? = null
     ): PhotoCaptureOutcome {
-        val device = sessionManager.cameraDevice ?: return PhotoCaptureOutcome(emptyList(), "Camera not ready")
-        val builder = device.createCaptureRequest(CameraDevice.TEMPLATE_STILL_CAPTURE)
-        builder.addTarget(jpegReader.surface)
-        manualController.applyToBuilder(
-            builder = builder,
+        val acquired = acquireSingleJpeg(
             caps = caps,
             controls = controls,
-            isVideoMode = false,
-            eisEnabled = false,
+            jpegReader = jpegReader,
+            previewSurface = null,
+            jpegQueue = jpegQueue,
+            deviceRotationDeg = deviceRotationDeg,
+            settings = settings,
+            location = location,
+            modeTag = modeTag,
+            applyPortraitBokeh = applyPortraitBokeh,
+            detectedFaces = detectedFaces,
+            applyDocScanner = applyDocScanner,
             aiProfile = aiProfile,
             focusPowerMode = focusPowerMode,
+            liveShadowBias = liveShadowBias,
+            liveHighlightBias = liveHighlightBias,
+            aiSceneName = aiSceneName,
+            tapMetered = tapMetered,
             aiAutoWb = aiAutoWb
-        )
-        val outJpegQuality = if (focusPowerMode) maxOf(controls.jpegQuality, 98) else controls.jpegQuality
-        builder.set(CaptureRequest.JPEG_QUALITY, outJpegQuality.toByte())
-        builder.set(CaptureRequest.JPEG_ORIENTATION, computeJpegOrientation(caps, deviceRotationDeg))
-
-        jpegQueue.clear()
-        val result = sessionManager.captureSingle(builder).getOrElse {
+        ).getOrElse {
             return PhotoCaptureOutcome(emptyList(), it.message ?: "Capture failed")
         }
-        val ts = result.get(TotalCaptureResult.SENSOR_TIMESTAMP) ?: 0L
-        val jpegBytes = awaitJpegBytes(jpegQueue, ts)
-            ?: return PhotoCaptureOutcome(emptyList(), "Timed out waiting for JPEG buffer")
-
-        var finalBytes = jpegBytes
-        var warning: String? = null
-        var outWidth = 0
-        var outHeight = 0
-        var outExifOrientation = ExifInterface.ORIENTATION_NORMAL
-
-        val halOrientationDeg = ExifProcessor.readJpegOrientationDegrees(jpegBytes)
-        val shouldRefine = applyPortraitBokeh ||
-            applyDocScanner ||
-            settings.watermarkEnabled ||
-            settings.aiAssistantEnabled ||
-            focusPowerMode ||
-            !controls.isManualMode ||
-            settings.libPatcher.colorProfile != com.example.processing.CameraColorProfile.NATURAL_TRUE
-
-        if (shouldRefine) {
-            val decodeMaxDim = if (focusPowerMode) 4096 else 3264
-            val rawBmp = YuvUtils.decodeJpegDownsampled(jpegBytes, maxDim = decodeMaxDim)
-            val bmp = YuvUtils.rotateBitmapIfNeeded(rawBmp, halOrientationDeg)
-            var processed = when {
-                applyDocScanner -> compEngine.documentScannerEngine.scanDocument(bmp)
-                applyPortraitBokeh -> compEngine.processPortrait(
-                    src = bmp,
-                    facesNormalized = detectedFaces,
-                    aiProfile = aiProfile,
-                    fullPower = focusPowerMode,
-                    libPatcher = settings.libPatcher,
-                    liveShadowBias = liveShadowBias,
-                    liveHighlightBias = liveHighlightBias
-                )
-                else -> {
-                    val assessed = compEngine.refineStandardPhoto(
-                        src = bmp,
-                        aiProfile = aiProfile,
-                        fullPower = focusPowerMode,
-                        libPatcher = settings.libPatcher,
-                        liveShadowBias = liveShadowBias,
-                        liveHighlightBias = liveHighlightBias
-                    )
-                    if (assessed.isUnstableOrBlurred) warning = "unstable"
-                    assessed.processedBitmap
-                }
-            }
-            if (settings.watermarkEnabled) {
-                val shotIso = result.get(TotalCaptureResult.SENSOR_SENSITIVITY) ?: controls.iso
-                val shotExp = result.get(TotalCaptureResult.SENSOR_EXPOSURE_TIME) ?: controls.exposureTimeNs
-                val shotAp = caps.apertures.firstOrNull() ?: 1.8f
-                val stamped = stampWatermark(
-                    src = processed,
-                    text = settings.watermarkText,
-                    style = settings.watermarkStyle,
-                    exifLine = formatExifBadge(shotAp, shotExp, shotIso, settings.libPatcher.colorProfile.badge)
-                )
-                if (stamped !== processed) processed.recycle()
-                processed = stamped
-            }
-            outWidth = processed.width
-            outHeight = processed.height
-            outExifOrientation = ExifInterface.ORIENTATION_NORMAL
-            finalBytes = encodeBitmapJpeg(processed, outJpegQuality)
-            if (processed !== bmp) processed.recycle()
-            bmp.recycle()
-        } else {
-            val bounds = BitmapFactory.Options().apply { inJustDecodeBounds = true }
-            BitmapFactory.decodeByteArray(jpegBytes, 0, jpegBytes.size, bounds)
-            outWidth = bounds.outWidth
-            outHeight = bounds.outHeight
-            outExifOrientation = when (halOrientationDeg) {
-                90 -> ExifInterface.ORIENTATION_ROTATE_90
-                180 -> ExifInterface.ORIENTATION_ROTATE_180
-                270 -> ExifInterface.ORIENTATION_ROTATE_270
-                else -> ExifInterface.ORIENTATION_NORMAL
-            }
-        }
-
-        val exifPayload = ExifProcessor.buildPayload(
-            caps = caps,
-            controls = controls,
-            settings = settings,
-            captureResult = result,
-            modeTag = modeTag,
-            frameCount = 1,
-            focusPowerMode = focusPowerMode,
-            aiSceneName = aiSceneName,
-            imageWidth = outWidth,
-            imageHeight = outHeight,
-            exifOrientation = outExifOrientation,
-            location = location,
-            tapMetered = tapMetered
-        )
-        finalBytes = ExifProcessor.injectJpegExifBytes(
-            context = context,
-            jpegBytes = finalBytes,
-            payload = exifPayload,
-            sourceHalJpegBytes = jpegBytes
-        )
-
-        val name = storageManager.buildUniqueFilename(settings.filenamePrefix, modeTag, "jpg")
-        val saved = storageManager.savePhotoBytes(finalBytes, name, "image/jpeg", settings, location)
-        val infoTag = buildString {
-            append(settings.libPatcher.colorProfile.badge)
-            if (focusPowerMode) append(" · TURBO 100%")
-        }
-        return PhotoCaptureOutcome(listOfNotNull(saved), statusWarning = warning, detailInfo = infoTag)
+        acquired.previewThumb?.let { if (!it.isRecycled) it.recycle() }
+        return processAcquiredSingleJpeg(acquired)
     }
 
     /**
@@ -427,7 +664,8 @@ class PhotoCaptureEngine(
 
     private suspend fun awaitBurstJpegFrames(
         jpegQueue: ConcurrentLinkedQueue<Pair<Long, ByteArray>>,
-        results: List<TotalCaptureResult>
+        results: List<TotalCaptureResult>,
+        timeoutMs: Long = 5000L
     ): List<Pair<TotalCaptureResult?, ByteArray>> {
         val expected = results.size.coerceAtLeast(1)
         val tsMap = HashMap<Long, TotalCaptureResult>(expected)
@@ -436,18 +674,17 @@ class PhotoCaptureEngine(
             if (ts != null) tsMap[ts] = res
         }
         val out = ArrayList<Pair<TotalCaptureResult?, ByteArray>>(expected)
-        withTimeoutOrNull(4500L) {
+        withTimeoutOrNull(timeoutMs) {
             while (out.size < expected) {
                 val item = jpegQueue.poll()
                 if (item != null) {
                     val matchedRes = tsMap[item.first] ?: results.getOrNull(out.size)
                     out.add(matchedRes to item.second)
                 } else {
-                    kotlinx.coroutines.delay(15L)
+                    delay(15L)
                 }
             }
         }
-        // Drain any straggler frames briefly
         while (out.size < expected) {
             val item = jpegQueue.poll() ?: break
             val matchedRes = tsMap[item.first] ?: results.getOrNull(out.size)
@@ -475,8 +712,11 @@ class PhotoCaptureEngine(
             ((timestamps.size - 1) * 1_000_000_000f) / (timestamps.last() - timestamps.first()).toFloat()
         } else 0f
 
+        val mirrorFront = caps.lensRole == LensRole.FRONT && settings.mirrorFrontCamera
         val needsPixelPass = settings.watermarkEnabled ||
             focusPowerMode ||
+            mirrorFront ||
+            settings.processingDetailPreset != ProcessingDetailPreset.BALANCED ||
             settings.libPatcher.colorProfile != com.example.processing.CameraColorProfile.NATURAL_TRUE ||
             kotlin.math.abs(liveShadowBias) > 0.01f ||
             kotlin.math.abs(liveHighlightBias) > 0.01f
@@ -501,14 +741,21 @@ class PhotoCaptureEngine(
                 if (needsPixelPass) {
                     val maxDim = if (focusPowerMode) 3264 else 2560
                     val decoded = YuvUtils.decodeJpegDownsampled(rawJpeg, maxDim = maxDim)
-                    val upright = YuvUtils.rotateBitmapIfNeeded(decoded, halRot)
+                    var upright = YuvUtils.rotateBitmapIfNeeded(decoded, halRot)
+                    if (mirrorFront) {
+                        val mirrored = YuvUtils.mirrorBitmapHorizontal(upright)
+                        if (mirrored !== upright) upright.recycle()
+                        upright = mirrored
+                    }
                     var processed = compEngine.refineStandardPhoto(
                         src = upright,
                         aiProfile = aiProfile,
                         fullPower = focusPowerMode,
                         libPatcher = settings.libPatcher,
                         liveShadowBias = liveShadowBias,
-                        liveHighlightBias = liveHighlightBias
+                        liveHighlightBias = liveHighlightBias,
+                        detailPreset = settings.processingDetailPreset,
+                        lowLightAiBoost = settings.lowLightAiBoost
                     ).processedBitmap
                     if (settings.watermarkEnabled) {
                         val shotIso = capRes?.get(TotalCaptureResult.SENSOR_SENSITIVITY) ?: controls.iso
@@ -675,12 +922,18 @@ class PhotoCaptureEngine(
         return PhotoCaptureOutcome(saved)
     }
 
-    suspend fun captureMultiFrameComputational(
+    /**
+     * Phase 1 of Computational Photography (HDR / Night / Astro / Super-Res):
+     * Captures a multi-frame JPEG sequence via the rock-solid 3-stream pipeline (`stillJpegReader` + `previewSurface`).
+     * Never blocks waiting for CPU alignment/merging — returns immediately so viewfinder & shutter stay fluid.
+     */
+    suspend fun acquireMultiFrameJpegBurst(
         caps: CameraDeviceCapabilities,
         controls: ProControlsState,
-        yuvCaptureSurface: Surface,
-        previewSurface: Surface,
-        yuvFrameQueue: ConcurrentLinkedQueue<Bitmap>,
+        jpegReader: ImageReader,
+        previewSurface: Surface?,
+        jpegQueue: ConcurrentLinkedQueue<Pair<Long, ByteArray>>,
+        deviceRotationDeg: Int,
         frameCount: Int,
         mode: AppDestination,
         superResEnabled: Boolean,
@@ -694,198 +947,417 @@ class PhotoCaptureEngine(
         aiSceneName: String? = null,
         tapMetered: Boolean = false,
         aiAutoWb: WhiteBalancePreset? = null,
-        onStageUpdate: (String) -> Unit
-    ): PhotoCaptureOutcome {
-        val device = sessionManager.cameraDevice ?: return PhotoCaptureOutcome(emptyList(), "Camera not ready")
-        yuvFrameQueue.clear()
+        liveExposureNs: Long = 0L,
+        liveIso: Int = 0
+    ): Result<AcquiredMultiFrameBurst> {
+        val device = sessionManager.cameraDevice
+            ?: return Result.failure(IllegalStateException("Camera not ready"))
+        val count = frameCount.coerceIn(2, 12)
+        val jpegOrientation = computeJpegOrientation(caps, deviceRotationDeg)
+        val rawBurstQuality = if (focusPowerMode) 96 else 93
 
-        val builders = ArrayList<CaptureRequest.Builder>(frameCount)
-        val evSteps = when (mode) {
-            AppDestination.HDR -> {
+        jpegQueue.clear()
+        val frames: List<Pair<TotalCaptureResult?, ByteArray>>
+
+        if (mode == AppDestination.HDR && !controls.manualExposureEnabled) {
+            if (caps.supportsManualSensor && liveExposureNs > 0L && liveIso > 0) {
+                // Hardware bracketed HDR+: direct sensor shutter + ISO per frame in one atomic burst
+                val pairs = computeHdrBracketExposures(
+                    baseExposureNs = liveExposureNs,
+                    baseIso = liveIso,
+                    stepsCount = count,
+                    exposureRange = caps.exposureTimeRangeNs,
+                    isoRange = caps.isoRange
+                )
+                val builders = pairs.map { (expNs, isoVal) ->
+                    device.createCaptureRequest(CameraDevice.TEMPLATE_STILL_CAPTURE).apply {
+                        addTarget(jpegReader.surface)
+                        if (previewSurface != null && previewSurface.isValid) addTarget(previewSurface)
+                        val bracketControls = controls.copy(
+                            isManualMode = true,
+                            manualExposureEnabled = true,
+                            exposureTimeNs = expNs,
+                            iso = isoVal
+                        )
+                        manualController.applyToBuilder(
+                            builder = this,
+                            caps = caps,
+                            controls = bracketControls,
+                            isVideoMode = false,
+                            eisEnabled = false,
+                            aiProfile = aiProfile,
+                            focusPowerMode = focusPowerMode,
+                            aiAutoWb = aiAutoWb
+                        )
+                        set(CaptureRequest.JPEG_QUALITY, rawBurstQuality.toByte())
+                        set(CaptureRequest.JPEG_ORIENTATION, jpegOrientation)
+                    }
+                }
+                val results = sessionManager.captureBurst(builders).getOrElse {
+                    return Result.failure(it)
+                }
+                frames = awaitBurstJpegFrames(jpegQueue, results, timeoutMs = (count * 500L + 4500L))
+            } else {
+                // Software AE fallback for lenses without MANUAL_SENSOR: staggered EV settle shots
                 val minEv = caps.aeCompensationRange.first
                 val maxEv = caps.aeCompensationRange.last
                 val span = maxOf(2, minOf(6, (maxEv - minEv) / 2))
-                if (frameCount >= 5) {
-                    val midSpan = (span / 2).coerceAtLeast(1)
-                    listOf(
-                        (-span).coerceAtLeast(minEv),
-                        (-midSpan).coerceAtLeast(minEv),
-                        0,
-                        midSpan.coerceAtMost(maxEv),
-                        span.coerceAtMost(maxEv)
-                    )
+                val evSteps = if (count >= 5) {
+                    val mid = (span / 2).coerceAtLeast(1)
+                    listOf((-span).coerceAtLeast(minEv), (-mid).coerceAtLeast(minEv), 0, mid.coerceAtMost(maxEv), span.coerceAtMost(maxEv))
                 } else {
                     listOf((-span).coerceAtLeast(minEv), 0, span.coerceAtMost(maxEv))
                 }
-            }
-            else -> List(frameCount) { 0 }
-        }
-
-        for (i in evSteps.indices) {
-            val b = device.createCaptureRequest(CameraDevice.TEMPLATE_STILL_CAPTURE)
-            b.addTarget(yuvCaptureSurface)
-            b.addTarget(previewSurface)
-            val stepControls = if (mode == AppDestination.HDR && !controls.manualExposureEnabled) {
-                controls.copy(exposureCompensationSteps = evSteps[i])
-            } else controls
-            manualController.applyToBuilder(
-                builder = b,
-                caps = caps,
-                controls = stepControls,
-                isVideoMode = false,
-                eisEnabled = false,
-                aiProfile = aiProfile,
-                focusPowerMode = focusPowerMode || astroMode,
-                aiAutoWb = aiAutoWb
-            )
-            builders.add(b)
-        }
-
-        onStageUpdate("CAPTURING")
-        val burstResults = sessionManager.captureBurst(builders).getOrElse {
-            return PhotoCaptureOutcome(emptyList(), it.message ?: "Burst failed")
-        }
-        val refCaptureResult = burstResults.getOrNull(burstResults.size / 2) ?: burstResults.firstOrNull()
-
-        val captured = collectBitmaps(yuvFrameQueue, evSteps.size)
-        if (captured.isEmpty()) {
-            return PhotoCaptureOutcome(emptyList(), "No YUV frames received")
-        }
-
-        return withContext(Dispatchers.Default) {
-            var warning: String? = null
-            var info: String? = null
-            var outputBmp: Bitmap = try {
-                when {
-                    mode == AppDestination.HDR -> {
-                        onStageUpdate("MERGING_HDR")
-                        val res = compEngine.hdrProcessor.processHdr(
-                            frames = captured,
-                            fullPower = focusPowerMode,
-                            vibranceBoost = (aiProfile?.vibranceBoost ?: settings.libPatcher.vibrance),
-                            toneStyle = settings.libPatcher.hdrToneStyle,
-                            shadowBias = liveShadowBias,
-                            highlightBias = liveHighlightBias
-                        )
-                        if (res.isUnstableCapture) warning = "unstable"
-                        info = "HDR ${res.alignedFrameCount}F | ${settings.libPatcher.colorProfile.badge}"
-                        compEngine.finishComputationalFrame(
-                            src = res.bitmap,
-                            sharpnessAmount = settings.libPatcher.sharpness,
+                val collected = ArrayList<Pair<TotalCaptureResult?, ByteArray>>(evSteps.size)
+                for (ev in evSteps) {
+                    val b = device.createCaptureRequest(CameraDevice.TEMPLATE_STILL_CAPTURE).apply {
+                        addTarget(jpegReader.surface)
+                        if (previewSurface != null && previewSurface.isValid) addTarget(previewSurface)
+                        manualController.applyToBuilder(
+                            builder = this,
+                            caps = caps,
+                            controls = controls.copy(exposureCompensationSteps = ev),
+                            isVideoMode = false,
+                            eisEnabled = false,
                             aiProfile = aiProfile,
-                            fullPower = focusPowerMode,
-                            libPatcher = settings.libPatcher,
-                            liveShadowBias = liveShadowBias,
-                            liveHighlightBias = liveHighlightBias
-                        ).also { if (it !== res.bitmap) res.bitmap.recycle() }
-                    }
-                    mode == AppDestination.NIGHT || astroMode -> {
-                        onStageUpdate("MERGING_NIGHT")
-                        val res = compEngine.nightProcessor.processNight(
-                            frames = captured,
-                            fullPower = focusPowerMode,
-                            astroMode = astroMode
+                            focusPowerMode = focusPowerMode,
+                            aiAutoWb = aiAutoWb
                         )
-                        if (res.isUnstableCapture) warning = "unstable"
-                        info = when {
-                            astroMode -> "ASTRO:${res.usedFrames}F | ${settings.libPatcher.colorProfile.badge}"
-                            res.isTripodDetected -> "TRIPOD:${res.usedFrames}F | ${settings.libPatcher.colorProfile.badge}"
-                            else -> "HANDHELD:${res.usedFrames}F | ${settings.libPatcher.colorProfile.badge}"
-                        }
-                        compEngine.finishComputationalFrame(
-                            src = res.bitmap,
-                            sharpnessAmount = settings.libPatcher.sharpness,
-                            aiProfile = aiProfile,
-                            fullPower = focusPowerMode || astroMode,
-                            libPatcher = settings.libPatcher,
-                            liveShadowBias = liveShadowBias,
-                            liveHighlightBias = liveHighlightBias
-                        ).also { if (it !== res.bitmap) res.bitmap.recycle() }
+                        set(CaptureRequest.JPEG_QUALITY, rawBurstQuality.toByte())
+                        set(CaptureRequest.JPEG_ORIENTATION, jpegOrientation)
                     }
-                    else -> {
-                        if (superResEnabled) {
-                            onStageUpdate("SUPER_RES")
-                            val sr = compEngine.superResolutionProcessor.processSuperResolution(
-                                frames = captured,
-                                fullPower = focusPowerMode
-                            )
-                            info = "${sr.statusReason} | ${settings.libPatcher.colorProfile.badge}"
-                            compEngine.finishComputationalFrame(
-                                src = sr.bitmap,
-                                sharpnessAmount = settings.libPatcher.sharpness,
-                                aiProfile = aiProfile,
-                                fullPower = focusPowerMode,
-                                libPatcher = settings.libPatcher,
-                                liveShadowBias = liveShadowBias,
-                                liveHighlightBias = liveHighlightBias
-                            ).also { if (it !== sr.bitmap) sr.bitmap.recycle() }
-                        } else {
-                            info = settings.libPatcher.colorProfile.badge
-                            compEngine.refineStandardPhoto(
-                                src = captured[0],
-                                aiProfile = aiProfile,
-                                fullPower = focusPowerMode,
-                                libPatcher = settings.libPatcher,
-                                liveShadowBias = liveShadowBias,
-                                liveHighlightBias = liveHighlightBias
-                            ).processedBitmap
-                        }
-                    }
+                    delay(95L)
+                    val res = sessionManager.captureSingle(b).getOrNull() ?: continue
+                    val ts = res.get(TotalCaptureResult.SENSOR_TIMESTAMP) ?: 0L
+                    val bytes = awaitJpegBytes(jpegQueue, ts) ?: continue
+                    collected.add(res to bytes)
                 }
-            } finally {
-                captured.forEach { if (!it.isRecycled) it.recycle() }
+                frames = collected
             }
-
-            if (settings.watermarkEnabled) {
-                val ap = caps.apertures.firstOrNull() ?: 1.8f
-                val stamped = stampWatermark(
-                    src = outputBmp,
-                    text = settings.watermarkText,
-                    style = settings.watermarkStyle,
-                    exifLine = formatExifBadge(ap, controls.exposureTimeNs, controls.iso, settings.libPatcher.colorProfile.badge)
+        } else {
+            val useNightBoost = (mode == AppDestination.NIGHT || astroMode) &&
+                caps.supportsManualSensor &&
+                !controls.manualExposureEnabled &&
+                liveExposureNs > 0L &&
+                liveIso > 0
+            val nightPair = if (useNightBoost) {
+                computeNightFrameExposure(
+                    baseExposureNs = liveExposureNs,
+                    baseIso = liveIso,
+                    astroMode = astroMode,
+                    exposureRange = caps.exposureTimeRangeNs,
+                    isoRange = caps.isoRange,
+                    targetMaxIso = settings.lowLightTargetMaxIso,
+                    evBiasSteps = controls.exposureCompensationSteps + settings.lowLightEvBiasSteps,
+                    aeCompensationStep = caps.aeCompensationStep.takeIf { it > 0f } ?: 0.1f
                 )
-                if (stamped !== outputBmp) outputBmp.recycle()
-                outputBmp = stamped
+            } else null
+
+            val effectiveControls = when {
+                nightPair != null -> controls.copy(
+                    isManualMode = true,
+                    manualExposureEnabled = true,
+                    exposureTimeNs = nightPair.first,
+                    iso = nightPair.second
+                )
+                (mode == AppDestination.NIGHT || astroMode) && !controls.manualExposureEnabled -> {
+                    val totalEv = controls.exposureCompensationSteps + settings.lowLightEvBiasSteps.coerceAtLeast(0)
+                    val boostedEv = totalEv.coerceIn(caps.aeCompensationRange.first, caps.aeCompensationRange.last)
+                    controls.copy(exposureCompensationSteps = boostedEv)
+                }
+                else -> controls
             }
 
-            val outW = outputBmp.width
-            val outH = outputBmp.height
-            val outJpegQuality = if (focusPowerMode) maxOf(controls.jpegQuality, 98) else controls.jpegQuality
-            val rawBytes = encodeBitmapJpeg(outputBmp, outJpegQuality)
-            outputBmp.recycle()
-
-            val tag = when {
-                astroMode -> "ASTRO"
-                mode == AppDestination.HDR -> "HDR"
-                mode == AppDestination.NIGHT -> "NIGHT"
-                superResEnabled -> "SR"
-                else -> "PHOTO"
+            val builders = List(count) {
+                device.createCaptureRequest(CameraDevice.TEMPLATE_STILL_CAPTURE).apply {
+                    addTarget(jpegReader.surface)
+                    if (previewSurface != null && previewSurface.isValid) addTarget(previewSurface)
+                    manualController.applyToBuilder(
+                        builder = this,
+                        caps = caps,
+                        controls = effectiveControls,
+                        isVideoMode = false,
+                        eisEnabled = false,
+                        aiProfile = aiProfile,
+                        focusPowerMode = focusPowerMode || astroMode,
+                        aiAutoWb = aiAutoWb
+                    )
+                    if (!focusPowerMode && mode == AppDestination.CAMERA && superResEnabled) {
+                        if (caps.noiseReductionModeIds.contains(CameraMetadata.NOISE_REDUCTION_MODE_FAST)) {
+                            set(CaptureRequest.NOISE_REDUCTION_MODE, CameraMetadata.NOISE_REDUCTION_MODE_FAST)
+                        }
+                    }
+                    set(CaptureRequest.JPEG_QUALITY, rawBurstQuality.toByte())
+                    set(CaptureRequest.JPEG_ORIENTATION, jpegOrientation)
+                }
             }
-            val exifPayload = ExifProcessor.buildPayload(
+            val results = sessionManager.captureBurst(builders).getOrElse {
+                return Result.failure(it)
+            }
+            val adaptiveTimeout = (count * 700L + 4500L).coerceAtLeast(6500L)
+            frames = awaitBurstJpegFrames(jpegQueue, results, timeoutMs = adaptiveTimeout)
+        }
+
+        if (frames.isEmpty()) {
+            return Result.failure(IllegalStateException("Timed out waiting for multi-frame buffers"))
+        }
+
+        val mirrorFront = caps.lensRole == LensRole.FRONT && settings.mirrorFrontCamera
+        val refBytes = frames[frames.size / 2].second
+        val refHalRot = ExifProcessor.readJpegOrientationDegrees(refBytes)
+        val previewThumb = decodePreviewThumb(refBytes, refHalRot, mirrorFront)
+        val initStage = when {
+            mode == AppDestination.HDR -> BackgroundProcessingStage.MERGING_HDR
+            mode == AppDestination.NIGHT || astroMode -> BackgroundProcessingStage.MERGING_NIGHT
+            superResEnabled -> BackgroundProcessingStage.SUPER_RES
+            else -> BackgroundProcessingStage.ALIGNING
+        }
+
+        return Result.success(
+            AcquiredMultiFrameBurst(
+                frames = frames,
+                previewThumb = previewThumb,
+                mode = mode,
+                superResEnabled = superResEnabled,
+                astroMode = astroMode,
                 caps = caps,
                 controls = controls,
                 settings = settings,
-                captureResult = refCaptureResult,
-                modeTag = tag,
-                frameCount = captured.size,
-                focusPowerMode = focusPowerMode || astroMode,
-                aiSceneName = aiSceneName,
-                imageWidth = outW,
-                imageHeight = outH,
-                exifOrientation = ExifInterface.ORIENTATION_NORMAL,
                 location = location,
-                tapMetered = tapMetered
+                aiProfile = aiProfile,
+                focusPowerMode = focusPowerMode,
+                liveShadowBias = liveShadowBias,
+                liveHighlightBias = liveHighlightBias,
+                aiSceneName = aiSceneName,
+                tapMetered = tapMetered,
+                mirrorFront = mirrorFront,
+                liveExposureNs = liveExposureNs,
+                liveIso = liveIso,
+                initialStage = initStage
             )
-            val bytes = ExifProcessor.injectJpegExifBytes(
-                context = context,
-                jpegBytes = rawBytes,
-                payload = exifPayload
-            )
-            val name = storageManager.buildUniqueFilename(settings.filenamePrefix, tag, "jpg")
-            val saved = storageManager.savePhotoBytes(bytes, name, "image/jpeg", settings, location)
-            val fullInfo = if (focusPowerMode && info != null) "$info · 100%" else info
-            PhotoCaptureOutcome(listOfNotNull(saved), statusWarning = warning, detailInfo = fullInfo)
+        )
+    }
+
+    /**
+     * Phase 2 of Computational Photography:
+     * Executes alignment, HDR fusion, Night reconstruction, Super-Res, color science & EXIF injection
+     * asynchronously on [Dispatchers.Default] while emitting fine-grained stage progress.
+     */
+    suspend fun processAcquiredMultiFrameBurst(
+        acquired: AcquiredMultiFrameBurst,
+        onStageUpdate: (BackgroundProcessingStage, Float) -> Unit = { _, _ -> }
+    ): PhotoCaptureOutcome = withContext(Dispatchers.Default) {
+        val settings = acquired.settings
+        val caps = acquired.caps
+        val controls = acquired.controls
+        val focusPowerMode = acquired.focusPowerMode
+        val mode = acquired.mode
+        val astroMode = acquired.astroMode
+        val superResEnabled = acquired.superResEnabled
+        val frames = acquired.frames
+        val refIdx = frames.size / 2
+        val refCaptureResult = frames.getOrNull(refIdx)?.first ?: frames.firstOrNull()?.first
+
+        val decodeMaxDim = when {
+            superResEnabled -> if (focusPowerMode) 1920 else 1600
+            frames.size >= 7 -> if (focusPowerMode) 2240 else 1920
+            frames.size >= 5 -> if (focusPowerMode) 2560 else 2048
+            else -> if (focusPowerMode) 3072 else 2304
         }
+
+        onStageUpdate(BackgroundProcessingStage.ALIGNING, 0.22f)
+        val decodedBitmaps = ArrayList<Bitmap>(frames.size)
+        var refW = 0
+        var refH = 0
+        for ((_, rawBytes) in frames) {
+            val halRot = ExifProcessor.readJpegOrientationDegrees(rawBytes)
+            val decoded = YuvUtils.decodeJpegDownsampled(rawBytes, maxDim = decodeMaxDim)
+            val upright = YuvUtils.rotateBitmapIfNeeded(decoded, halRot)
+            if (refW == 0) {
+                refW = upright.width
+                refH = upright.height
+                decodedBitmaps.add(upright)
+            } else if (upright.width != refW || upright.height != refH) {
+                val matched = Bitmap.createScaledBitmap(upright, refW, refH, true)
+                if (matched !== upright) upright.recycle()
+                decodedBitmaps.add(matched)
+            } else {
+                decodedBitmaps.add(upright)
+            }
+        }
+
+        if (decodedBitmaps.isEmpty()) {
+            return@withContext PhotoCaptureOutcome(emptyList(), "Failed to decode captured frames")
+        }
+
+        var warning: String? = null
+        var info: String? = null
+        var outputBmp: Bitmap = try {
+            when {
+                mode == AppDestination.HDR -> {
+                    onStageUpdate(BackgroundProcessingStage.MERGING_HDR, 0.42f)
+                    val res = compEngine.hdrProcessor.processHdr(
+                        frames = decodedBitmaps,
+                        fullPower = focusPowerMode,
+                        vibranceBoost = (acquired.aiProfile?.vibranceBoost ?: settings.libPatcher.vibrance),
+                        toneStyle = settings.libPatcher.hdrToneStyle,
+                        shadowBias = acquired.liveShadowBias,
+                        highlightBias = acquired.liveHighlightBias,
+                        enableGhostRejection = settings.hdrGhostRejection
+                    )
+                    if (res.isUnstableCapture) warning = "unstable"
+                    info = "HDR ${res.alignedFrameCount}F | ${settings.libPatcher.colorProfile.badge}"
+                    onStageUpdate(BackgroundProcessingStage.ENHANCING, 0.74f)
+                    compEngine.finishComputationalFrame(
+                        src = res.bitmap,
+                        sharpnessAmount = settings.libPatcher.sharpness,
+                        aiProfile = acquired.aiProfile,
+                        fullPower = focusPowerMode,
+                        libPatcher = settings.libPatcher,
+                        liveShadowBias = acquired.liveShadowBias,
+                        liveHighlightBias = acquired.liveHighlightBias,
+                        detailPreset = settings.processingDetailPreset,
+                        lowLightAiBoost = settings.lowLightAiBoost
+                    ).also { if (it !== res.bitmap) res.bitmap.recycle() }
+                }
+                mode == AppDestination.NIGHT || astroMode -> {
+                    onStageUpdate(BackgroundProcessingStage.MERGING_NIGHT, 0.42f)
+                    val res = compEngine.nightProcessor.processNight(
+                        frames = decodedBitmaps,
+                        fullPower = focusPowerMode,
+                        astroMode = astroMode,
+                        lowLightBoost = settings.lowLightAiBoost
+                    )
+                    if (res.isUnstableCapture) warning = "unstable"
+                    info = when {
+                        astroMode -> "ASTRO:${res.usedFrames}F | ${settings.libPatcher.colorProfile.badge}"
+                        res.isTripodDetected -> "TRIPOD:${res.usedFrames}F | ${settings.libPatcher.colorProfile.badge}"
+                        else -> "NIGHT:${res.usedFrames}F | ${settings.libPatcher.colorProfile.badge}"
+                    }
+                    onStageUpdate(BackgroundProcessingStage.ENHANCING, 0.74f)
+                    compEngine.finishComputationalFrame(
+                        src = res.bitmap,
+                        sharpnessAmount = settings.libPatcher.sharpness,
+                        aiProfile = acquired.aiProfile,
+                        fullPower = focusPowerMode || astroMode,
+                        libPatcher = settings.libPatcher,
+                        liveShadowBias = acquired.liveShadowBias,
+                        liveHighlightBias = acquired.liveHighlightBias,
+                        detailPreset = settings.processingDetailPreset,
+                        lowLightAiBoost = settings.lowLightAiBoost
+                    ).also { if (it !== res.bitmap) res.bitmap.recycle() }
+                }
+                superResEnabled -> {
+                    onStageUpdate(BackgroundProcessingStage.SUPER_RES, 0.42f)
+                    val sr = compEngine.superResolutionProcessor.processSuperResolution(
+                        frames = decodedBitmaps,
+                        fullPower = focusPowerMode
+                    )
+                    info = "${sr.statusReason} | ${settings.libPatcher.colorProfile.badge}"
+                    onStageUpdate(BackgroundProcessingStage.ENHANCING, 0.74f)
+                    compEngine.finishComputationalFrame(
+                        src = sr.bitmap,
+                        sharpnessAmount = settings.libPatcher.sharpness,
+                        aiProfile = acquired.aiProfile,
+                        fullPower = focusPowerMode,
+                        libPatcher = settings.libPatcher,
+                        liveShadowBias = acquired.liveShadowBias,
+                        liveHighlightBias = acquired.liveHighlightBias,
+                        detailPreset = settings.processingDetailPreset,
+                        lowLightAiBoost = settings.lowLightAiBoost
+                    ).also { if (it !== sr.bitmap) sr.bitmap.recycle() }
+                }
+                else -> {
+                    info = settings.libPatcher.colorProfile.badge
+                    onStageUpdate(BackgroundProcessingStage.ENHANCING, 0.65f)
+                    compEngine.refineStandardPhoto(
+                        src = decodedBitmaps[0],
+                        aiProfile = acquired.aiProfile,
+                        fullPower = focusPowerMode,
+                        libPatcher = settings.libPatcher,
+                        liveShadowBias = acquired.liveShadowBias,
+                        liveHighlightBias = acquired.liveHighlightBias,
+                        detailPreset = settings.processingDetailPreset,
+                        lowLightAiBoost = settings.lowLightAiBoost
+                    ).processedBitmap
+                }
+            }
+        } finally {
+            decodedBitmaps.forEach { if (!it.isRecycled) it.recycle() }
+        }
+
+        if (acquired.mirrorFront) {
+            val mirrored = YuvUtils.mirrorBitmapHorizontal(outputBmp)
+            if (mirrored !== outputBmp) outputBmp.recycle()
+            outputBmp = mirrored
+        }
+
+        if (settings.watermarkEnabled) {
+            val ap = caps.apertures.firstOrNull() ?: 1.8f
+            val expToBadge = refCaptureResult?.get(TotalCaptureResult.SENSOR_EXPOSURE_TIME)
+                ?: acquired.liveExposureNs.takeIf { it > 0L } ?: controls.exposureTimeNs
+            val isoToBadge = refCaptureResult?.get(TotalCaptureResult.SENSOR_SENSITIVITY)
+                ?: acquired.liveIso.takeIf { it > 0 } ?: controls.iso
+            val stamped = stampWatermark(
+                src = outputBmp,
+                text = settings.watermarkText,
+                style = settings.watermarkStyle,
+                exifLine = formatExifBadge(ap, expToBadge, isoToBadge, settings.libPatcher.colorProfile.badge)
+            )
+            if (stamped !== outputBmp) outputBmp.recycle()
+            outputBmp = stamped
+        }
+
+        onStageUpdate(BackgroundProcessingStage.SAVING, 0.90f)
+        val outW = outputBmp.width
+        val outH = outputBmp.height
+        val outJpegQuality = if (focusPowerMode) maxOf(controls.jpegQuality, 98) else controls.jpegQuality
+        val rawBytes = encodeBitmapJpeg(outputBmp, outJpegQuality)
+        outputBmp.recycle()
+
+        val tag = when {
+            astroMode -> "ASTRO"
+            mode == AppDestination.HDR -> "HDR"
+            mode == AppDestination.NIGHT -> "NIGHT"
+            superResEnabled -> "SR"
+            else -> "PHOTO"
+        }
+        val exifPayload = ExifProcessor.buildPayload(
+            caps = caps,
+            controls = controls,
+            settings = settings,
+            captureResult = refCaptureResult,
+            modeTag = tag,
+            frameCount = frames.size,
+            focusPowerMode = focusPowerMode || astroMode,
+            aiSceneName = acquired.aiSceneName,
+            imageWidth = outW,
+            imageHeight = outH,
+            exifOrientation = ExifInterface.ORIENTATION_NORMAL,
+            location = acquired.location,
+            tapMetered = acquired.tapMetered
+        )
+        val bytes = ExifProcessor.injectJpegExifBytes(
+            context = context,
+            jpegBytes = rawBytes,
+            payload = exifPayload
+        )
+        val name = storageManager.buildUniqueFilename(settings.filenamePrefix, tag, "jpg")
+        val saved = storageManager.savePhotoBytes(bytes, name, "image/jpeg", settings, acquired.location)
+        val fullInfo = if (focusPowerMode && info != null) "$info · 100%" else info
+        PhotoCaptureOutcome(listOfNotNull(saved), statusWarning = warning, detailInfo = fullInfo)
+    }
+
+    private fun decodePreviewThumb(jpegBytes: ByteArray, halOrientationDeg: Int, mirrorFront: Boolean): Bitmap? {
+        return runCatching {
+            val tiny = YuvUtils.decodeJpegDownsampled(jpegBytes, maxDim = 180)
+            val upright = YuvUtils.rotateBitmapIfNeeded(tiny, halOrientationDeg)
+            if (mirrorFront) {
+                val mirrored = YuvUtils.mirrorBitmapHorizontal(upright)
+                if (mirrored !== upright) upright.recycle()
+                mirrored
+            } else upright
+        }.getOrNull()
     }
 
     suspend fun stitchAndSavePanorama(

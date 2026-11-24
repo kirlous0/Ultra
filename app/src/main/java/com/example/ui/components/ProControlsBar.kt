@@ -44,6 +44,7 @@ import com.example.camera.FocusPeakingColor
 import com.example.camera.FocusPeakingSensitivity
 import com.example.camera.ProControlsState
 import com.example.camera.WhiteBalancePreset
+import com.example.camera.computeIsoPriorityShutterNs
 import com.example.system.AppStrings
 import com.example.ui.theme.AmberFocus
 import com.example.ui.theme.CarbonSurface
@@ -76,6 +77,9 @@ fun ProControlsBar(
     focusPeakingColor: FocusPeakingColor = FocusPeakingColor.CYAN,
     focusPeakingSensitivity: FocusPeakingSensitivity = FocusPeakingSensitivity.MEDIUM,
     focusSharpnessPercent: Int = 0,
+    liveIso: Int = 0,
+    liveExposureNs: Long = 0L,
+    onSelectIsoPreset: ((Int?) -> Unit)? = null,
     onToggleFocusPeaking: (() -> Unit)? = null,
     onSelectPeakingStyle: ((FocusPeakingColor?, FocusPeakingSensitivity?) -> Unit)? = null
 ) {
@@ -206,7 +210,18 @@ fun ProControlsBar(
                     ) {
                         FilterChip(
                             selected = !controls.manualExposureEnabled,
-                            onClick = { onUpdateControls { it.copy(manualExposureEnabled = !it.manualExposureEnabled) } },
+                            onClick = {
+                                if (controls.manualExposureEnabled && onSelectIsoPreset != null) {
+                                    onSelectIsoPreset(null)
+                                } else {
+                                    onUpdateControls {
+                                        it.copy(
+                                            manualExposureEnabled = !it.manualExposureEnabled,
+                                            manualShutterPinned = false
+                                        )
+                                    }
+                                }
+                            },
                             label = {
                                 Text(
                                     if (controls.manualExposureEnabled) strings.manualLabel else strings.autoLabel,
@@ -219,11 +234,65 @@ fun ProControlsBar(
                             ),
                             modifier = Modifier.testTag("pro_manual_exposure_toggle")
                         )
+                        val shutterModeNote = when {
+                            !controls.manualExposureEnabled -> strings.autoLabel
+                            controls.manualShutterPinned -> strings.shutterLockedLabel
+                            else -> strings.isoAutoShutterLabel
+                        }
                         Text(
-                            text = "ISO ${controls.iso}  ·  ${formatShutterNs(controls.exposureTimeNs)}",
-                            style = MaterialTheme.typography.labelMedium,
+                            text = "ISO ${controls.iso} · ${formatShutterNs(controls.exposureTimeNs)} ($shutterModeNote)",
+                            style = MaterialTheme.typography.labelSmall,
                             color = AmberFocus
                         )
+                    }
+
+                    // Quick Low-Light & Pro ISO Presets within sensor range
+                    val isoPresets = listOf(100, 200, 400, 800, 1600, 3200).filter { it in isoRange }
+                    Row(
+                        modifier = Modifier
+                            .fillMaxWidth()
+                            .horizontalScroll(rememberScrollState())
+                            .padding(vertical = 4.dp),
+                        horizontalArrangement = Arrangement.spacedBy(6.dp)
+                    ) {
+                        ProPillButton(
+                            label = strings.resetAutoLabel,
+                            selected = !controls.manualExposureEnabled,
+                            testTag = "pro_iso_auto_pill",
+                            onClick = {
+                                if (onSelectIsoPreset != null) onSelectIsoPreset(null)
+                                else onUpdateControls { it.copy(manualExposureEnabled = false, manualShutterPinned = false) }
+                            }
+                        )
+                        isoPresets.forEach { presetIso ->
+                            ProPillButton(
+                                label = "ISO $presetIso",
+                                selected = controls.manualExposureEnabled && kotlin.math.abs(controls.iso - presetIso) <= 25,
+                                activeColor = if (presetIso >= 1600) SapphireTelemetry else AmberFocus,
+                                testTag = "pro_iso_preset_$presetIso",
+                                onClick = {
+                                    if (onSelectIsoPreset != null) {
+                                        onSelectIsoPreset(presetIso)
+                                    } else {
+                                        val matched = computeIsoPriorityShutterNs(
+                                            targetIso = presetIso,
+                                            liveIso = liveIso,
+                                            liveExposureNs = liveExposureNs,
+                                            evSteps = controls.exposureCompensationSteps,
+                                            evStepSize = caps.aeCompensationStep.takeIf { it > 0f } ?: 0.1f,
+                                            exposureRange = expRange
+                                        )
+                                        onUpdateControls {
+                                            it.copy(
+                                                manualExposureEnabled = true,
+                                                iso = presetIso,
+                                                exposureTimeNs = if (it.manualShutterPinned) it.exposureTimeNs else matched
+                                            )
+                                        }
+                                    }
+                                }
+                            )
+                        }
                     }
 
                     Text(
@@ -235,8 +304,12 @@ fun ProControlsBar(
                         value = controls.iso.toFloat().coerceIn(isoRange.first.toFloat(), isoRange.last.toFloat()),
                         onValueChange = { v ->
                             val snapped = ((v / 25f).roundToInt() * 25).coerceIn(isoRange.first, isoRange.last)
-                            onUpdateControls {
-                                it.copy(manualExposureEnabled = true, iso = snapped)
+                            if (onSelectIsoPreset != null) {
+                                onSelectIsoPreset(snapped)
+                            } else {
+                                onUpdateControls {
+                                    it.copy(manualExposureEnabled = true, iso = snapped)
+                                }
                             }
                         },
                         valueRange = isoRange.first.toFloat()..isoRange.last.toFloat().coerceAtLeast(isoRange.first.toFloat() + 1f),
@@ -257,7 +330,13 @@ fun ProControlsBar(
                         value = curLog.toFloat(),
                         onValueChange = { v ->
                             val ns = kotlin.math.exp(v.toDouble()).toLong().coerceIn(expRange.first, expRange.last)
-                            onUpdateControls { it.copy(manualExposureEnabled = true, exposureTimeNs = ns) }
+                            onUpdateControls {
+                                it.copy(
+                                    manualExposureEnabled = true,
+                                    manualShutterPinned = true,
+                                    exposureTimeNs = ns
+                                )
+                            }
                         },
                         valueRange = minLog.toFloat()..maxLog.toFloat().coerceAtLeast(minLog.toFloat() + 0.01f),
                         colors = SliderDefaults.colors(thumbColor = SapphireTelemetry, activeTrackColor = SapphireTelemetry),
@@ -393,13 +472,45 @@ fun ProControlsBar(
                         value = controls.exposureCompensationSteps.toFloat().coerceIn(evSteps.first.toFloat(), evSteps.last.toFloat()),
                         onValueChange = { v ->
                             onUpdateControls {
-                                it.copy(manualExposureEnabled = false, exposureCompensationSteps = v.roundToInt())
+                                it.copy(
+                                    manualExposureEnabled = false,
+                                    manualShutterPinned = false,
+                                    exposureCompensationSteps = v.roundToInt()
+                                )
                             }
                         },
                         valueRange = evSteps.first.toFloat()..evSteps.last.toFloat(),
                         colors = SliderDefaults.colors(thumbColor = AmberFocus, activeTrackColor = AmberFocus),
                         modifier = Modifier.testTag("pro_ev_slider")
                     )
+                    val evStepSize = caps.aeCompensationStep.takeIf { it > 0f } ?: 0.33f
+                    val targetEvValues = listOf(-1.0f, 0f, 0.7f, 1.3f, 2.0f)
+                    Row(
+                        modifier = Modifier
+                            .fillMaxWidth()
+                            .horizontalScroll(rememberScrollState())
+                            .padding(bottom = 6.dp),
+                        horizontalArrangement = Arrangement.spacedBy(6.dp)
+                    ) {
+                        targetEvValues.forEach { targetEv ->
+                            val step = (targetEv / evStepSize).roundToInt().coerceIn(evSteps.first, evSteps.last)
+                            val displayEv = step * evStepSize
+                            ProPillButton(
+                                label = "${if (displayEv > 0f) "+" else ""}${"%.1f".format(displayEv)} EV",
+                                selected = !controls.manualExposureEnabled && controls.exposureCompensationSteps == step,
+                                testTag = "pro_ev_chip_${step}",
+                                onClick = {
+                                    onUpdateControls {
+                                        it.copy(
+                                            manualExposureEnabled = false,
+                                            manualShutterPinned = false,
+                                            exposureCompensationSteps = step
+                                        )
+                                    }
+                                }
+                            )
+                        }
+                    }
                 }
 
                 Row(
@@ -658,6 +769,159 @@ fun ProControlsBar(
                     color = TextSecondary
                 )
             }
+        }
+    }
+}
+
+@Composable
+fun LowLightExposureIsoStrip(
+    cam: CameraDeviceCapabilities,
+    proControls: ProControlsState,
+    telemetryIso: Int,
+    telemetryExpNs: Long,
+    strings: AppStrings,
+    onSetEvSteps: (Int) -> Unit,
+    onSelectIso: (Int?) -> Unit,
+    modifier: Modifier = Modifier
+) {
+    Column(
+        modifier = modifier,
+        verticalArrangement = Arrangement.spacedBy(6.dp)
+    ) {
+        val evSteps = cam.aeCompensationRange
+        val stepSize = cam.aeCompensationStep.takeIf { it > 0f } ?: 0.1f
+        val curEv = proControls.exposureCompensationSteps * stepSize
+        Row(
+            modifier = Modifier.fillMaxWidth(),
+            horizontalArrangement = Arrangement.SpaceBetween,
+            verticalAlignment = Alignment.CenterVertically
+        ) {
+            Text(
+                text = strings.exposureIsoTitle,
+                style = MaterialTheme.typography.labelMedium,
+                color = SapphireTelemetry
+            )
+            val readout = if (proControls.manualExposureEnabled) {
+                "ISO ${proControls.iso} · ${formatShutterNs(proControls.exposureTimeNs)}"
+            } else {
+                val evPrefix = if (curEv >= 0f) "+" else ""
+                "${evPrefix}${"%.1f".format(curEv)} EV · ISO ${if (telemetryIso > 0) telemetryIso else "--"}"
+            }
+            Text(
+                text = readout,
+                style = MaterialTheme.typography.labelSmall,
+                color = AmberFocus
+            )
+        }
+
+        // Exposure Compensation (EV) slider + quick presets (works on every Galaxy A05s lens)
+        if (evSteps.last > evSteps.first) {
+            Row(verticalAlignment = Alignment.CenterVertically) {
+                Text(
+                    text = "${strings.evLabel} ${if (curEv >= 0f) "+" else ""}${"%.1f".format(curEv)}",
+                    style = MaterialTheme.typography.labelSmall,
+                    color = TextPrimary,
+                    modifier = Modifier.padding(end = 8.dp)
+                )
+                Slider(
+                    value = proControls.exposureCompensationSteps.toFloat()
+                        .coerceIn(evSteps.first.toFloat(), evSteps.last.toFloat()),
+                    onValueChange = { v -> onSetEvSteps(v.roundToInt()) },
+                    valueRange = evSteps.first.toFloat()..evSteps.last.toFloat(),
+                    colors = SliderDefaults.colors(
+                        thumbColor = AmberFocus,
+                        activeTrackColor = AmberFocus
+                    ),
+                    modifier = Modifier
+                        .weight(1f)
+                        .height(26.dp)
+                        .testTag("low_light_ev_slider")
+                )
+            }
+            Row(
+                modifier = Modifier
+                    .fillMaxWidth()
+                    .horizontalScroll(rememberScrollState()),
+                horizontalArrangement = Arrangement.spacedBy(6.dp)
+            ) {
+                listOf(-1.0f, 0f, 0.7f, 1.3f, 2.0f).forEach { targetEv ->
+                    val step = (targetEv / stepSize).roundToInt().coerceIn(evSteps.first, evSteps.last)
+                    val shownEv = step * stepSize
+                    ProPillButton(
+                        label = "${if (shownEv > 0f) "+" else ""}${"%.1f".format(shownEv)} EV",
+                        selected = !proControls.manualExposureEnabled && proControls.exposureCompensationSteps == step,
+                        testTag = "low_light_ev_chip_$step",
+                        onClick = { onSetEvSteps(step) }
+                    )
+                }
+            }
+        }
+
+        // ISO adjustment controls for low-light when sensor exposes MANUAL_SENSOR
+        if (cam.supportsManualSensor) {
+            val isoRange = cam.isoRange ?: (100..3200)
+            val isoPresets = listOf(400, 800, 1600, 3200, 6400).filter { it in isoRange }
+            Row(
+                modifier = Modifier
+                    .fillMaxWidth()
+                    .horizontalScroll(rememberScrollState()),
+                horizontalArrangement = Arrangement.spacedBy(6.dp),
+                verticalAlignment = Alignment.CenterVertically
+            ) {
+                ProPillButton(
+                    label = "${strings.isoLabel}: ${strings.resetAutoLabel}",
+                    selected = !proControls.manualExposureEnabled,
+                    activeColor = EmeraldLock,
+                    testTag = "low_light_iso_auto_pill",
+                    onClick = { onSelectIso(null) }
+                )
+                isoPresets.forEach { preset ->
+                    ProPillButton(
+                        label = "ISO $preset",
+                        selected = proControls.manualExposureEnabled && kotlin.math.abs(proControls.iso - preset) <= 25,
+                        activeColor = SapphireTelemetry,
+                        testTag = "low_light_iso_pill_$preset",
+                        onClick = { onSelectIso(preset) }
+                    )
+                }
+            }
+            Row(verticalAlignment = Alignment.CenterVertically) {
+                Text(
+                    text = "${strings.isoLabel} ${if (proControls.manualExposureEnabled) proControls.iso else telemetryIso.coerceAtLeast(isoRange.first)}",
+                    style = MaterialTheme.typography.labelSmall,
+                    color = TextSecondary,
+                    modifier = Modifier.padding(end = 8.dp)
+                )
+                Slider(
+                    value = proControls.iso.toFloat().coerceIn(isoRange.first.toFloat(), isoRange.last.toFloat()),
+                    onValueChange = { v ->
+                        val snapped = ((v / 25f).roundToInt() * 25).coerceIn(isoRange.first, isoRange.last)
+                        onSelectIso(snapped)
+                    },
+                    valueRange = isoRange.first.toFloat()..isoRange.last.toFloat().coerceAtLeast(isoRange.first.toFloat() + 1f),
+                    colors = SliderDefaults.colors(
+                        thumbColor = SapphireTelemetry,
+                        activeTrackColor = SapphireTelemetry
+                    ),
+                    modifier = Modifier
+                        .weight(1f)
+                        .height(26.dp)
+                        .testTag("low_light_iso_slider")
+                )
+            }
+            if (telemetryExpNs > 0L && proControls.manualExposureEnabled) {
+                Text(
+                    text = "${strings.isoAutoShutterLabel}: ${formatShutterNs(proControls.exposureTimeNs)}",
+                    style = MaterialTheme.typography.labelSmall,
+                    color = TextSecondary
+                )
+            }
+        } else {
+            Text(
+                text = strings.manualIsoUnavailableHint,
+                style = MaterialTheme.typography.labelSmall,
+                color = TextSecondary
+            )
         }
     }
 }

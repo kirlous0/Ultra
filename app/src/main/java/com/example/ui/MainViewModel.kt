@@ -16,6 +16,7 @@ import com.example.camera.CameraHardwareScanner
 import com.example.camera.CameraSessionManager
 import com.example.camera.CaptureFormat
 import com.example.camera.FlashMode
+import com.example.camera.GridOverlayType
 import com.example.camera.HardwareInventory
 import com.example.camera.HighSpeedConfig
 import com.example.camera.LensRole
@@ -26,6 +27,7 @@ import com.example.camera.RawCaptureEngine
 import com.example.camera.VideoCodecType
 import com.example.camera.WhiteBalancePreset
 import com.example.camera.clampProControlsToCamera
+import com.example.camera.computeIsoPriorityShutterNs
 import com.example.processing.AIPhotographyEngine
 import com.example.processing.ComputationalPhotographyEngine
 import com.example.processing.CropAspectOption
@@ -58,7 +60,7 @@ data class VideoSettingsUiState(
     val codec: VideoCodecType = VideoCodecType.H264,
     val recordAudio: Boolean = true,
     val audioSource: AudioSourceOption = AudioSourceOption.MIC,
-    val eisEnabled: Boolean = true,
+    val eisEnabled: Boolean = false,
     val timeLapseFactor: Int = 1,
     val selectedHighSpeed: HighSpeedConfig? = null
 )
@@ -102,6 +104,7 @@ class MainViewModel(application: Application) : AndroidViewModel(application) {
     val healthState: StateFlow<SystemHealthState> = thermalMonitor.healthState
     val inventory: StateFlow<HardwareInventory?> = cameraController.inventory
     val activeCamera: StateFlow<CameraDeviceCapabilities?> = cameraController.activeCamera
+    val processingJobs = cameraController.processingJobs
     val videoRecordingState = videoEngine.uiState
 
     private val _currentDestination = MutableStateFlow(AppDestination.CAMERA)
@@ -142,6 +145,7 @@ class MainViewModel(application: Application) : AndroidViewModel(application) {
 
     private val _studioBusy = MutableStateFlow(false)
     val studioBusy: StateFlow<Boolean> = _studioBusy.asStateFlow()
+    private var studioRenderJob: kotlinx.coroutines.Job? = null
 
     private val _diagnosticsJson = MutableStateFlow("")
     val diagnosticsJson: StateFlow<String> = _diagnosticsJson.asStateFlow()
@@ -169,7 +173,9 @@ class MainViewModel(application: Application) : AndroidViewModel(application) {
                     controls = _proControls.value,
                     settings = s,
                     toolMode = _photoToolMode.value,
-                    eisEnabled = _videoSettings.value.eisEnabled
+                    eisEnabled = _videoSettings.value.eisEnabled,
+                    selectedVideoSize = _videoSettings.value.selectedSize,
+                    selectedVideoFps = _videoSettings.value.selectedFps
                 )
             }
         }
@@ -235,15 +241,42 @@ class MainViewModel(application: Application) : AndroidViewModel(application) {
             ?: cam.videoSizes.firstOrNull()
             ?: Size(1920, 1080)
 
+        val validFps = clampVideoFpsForSize(cam, bestVideoSize, _videoSettings.value.selectedFps)
         val hs = cam.highSpeedConfigs.firstOrNull { it.maxFps >= 120 }
             ?: cam.highSpeedConfigs.firstOrNull()
 
-        _videoSettings.value = _videoSettings.value.copy(
+        val updatedVideo = _videoSettings.value.copy(
             selectedSize = bestVideoSize,
+            selectedFps = validFps,
             codec = chosenCodec,
             eisEnabled = _videoSettings.value.eisEnabled && cam.supportsEis,
             selectedHighSpeed = hs
         )
+        _videoSettings.value = updatedVideo
+        viewModelScope.launch {
+            cameraController.reconfigureForState(
+                mode = _currentDestination.value,
+                controls = clamped,
+                settings = settings.value,
+                toolMode = _photoToolMode.value,
+                eisEnabled = updatedVideo.eisEnabled,
+                selectedVideoSize = updatedVideo.selectedSize,
+                selectedVideoFps = updatedVideo.selectedFps
+            )
+        }
+    }
+
+    private fun clampVideoFpsForSize(cam: CameraDeviceCapabilities, size: Size, desiredFps: Int): Int {
+        val key = "${size.width}x${size.height}"
+        val supported = cam.videoFpsBySize[key]
+            ?.map { it.last }
+            ?.filter { it >= 24 }
+            ?.distinct()
+            ?.sorted()
+            .orEmpty()
+        if (supported.isEmpty()) return desiredFps.coerceIn(24, 60)
+        if (supported.contains(desiredFps)) return desiredFps
+        return if (supported.contains(30)) 30 else supported.last()
     }
 
     fun navigateTo(destination: AppDestination) {
@@ -271,7 +304,9 @@ class MainViewModel(application: Application) : AndroidViewModel(application) {
                     controls = updatedControls,
                     settings = settings.value,
                     toolMode = _photoToolMode.value,
-                    eisEnabled = _videoSettings.value.eisEnabled
+                    eisEnabled = _videoSettings.value.eisEnabled,
+                    selectedVideoSize = _videoSettings.value.selectedSize,
+                    selectedVideoFps = _videoSettings.value.selectedFps
                 )
             }
         }
@@ -317,6 +352,8 @@ class MainViewModel(application: Application) : AndroidViewModel(application) {
                 settings = settings.value,
                 toolMode = _photoToolMode.value,
                 eisEnabled = _videoSettings.value.eisEnabled,
+                selectedVideoSize = _videoSettings.value.selectedSize,
+                selectedVideoFps = _videoSettings.value.selectedFps,
                 recreateSession = needSessionRecreate
             )
         }
@@ -349,7 +386,9 @@ class MainViewModel(application: Application) : AndroidViewModel(application) {
                 controls = _proControls.value,
                 settings = settings.value,
                 toolMode = tool,
-                eisEnabled = _videoSettings.value.eisEnabled
+                eisEnabled = _videoSettings.value.eisEnabled,
+                selectedVideoSize = _videoSettings.value.selectedSize,
+                selectedVideoFps = _videoSettings.value.selectedFps
             )
         }
     }
@@ -403,6 +442,66 @@ class MainViewModel(application: Application) : AndroidViewModel(application) {
 
     fun setLiveToneBiases(shadowBias: Float, highlightBias: Float) {
         cameraController.setLiveToneBiases(shadowBias, highlightBias)
+    }
+
+    /**
+     * Adjusts manual ISO for low-light or Pro shooting. Passing null returns cleanly to Auto AE.
+     * When shutter has not been pinned manually, scales exposure time using live telemetry so
+     * preview & capture retain proper EV balance without handheld blur.
+     */
+    fun applyIsoAdjustment(targetIso: Int?) {
+        if (targetIso == null) {
+            updateProControls {
+                it.copy(
+                    manualExposureEnabled = false,
+                    manualShutterPinned = false
+                )
+            }
+            return
+        }
+        val cam = activeCamera.value
+        val telemetry = cameraController.telemetry.value
+        val isNight = _currentDestination.value == AppDestination.NIGHT
+        val clampedIso = cam?.isoRange?.let { targetIso.coerceIn(it.first, it.last) } ?: targetIso
+        updateProControls { cur ->
+            val nextExp = if (cur.manualShutterPinned) {
+                cur.exposureTimeNs
+            } else {
+                computeIsoPriorityShutterNs(
+                    targetIso = clampedIso,
+                    liveIso = telemetry.iso,
+                    liveExposureNs = telemetry.exposureTimeNs,
+                    evSteps = cur.exposureCompensationSteps,
+                    evStepSize = cam?.aeCompensationStep?.takeIf { it > 0f } ?: 0.1f,
+                    exposureRange = cam?.exposureTimeRangeNs,
+                    maxHandheldNs = if (isNight) 125_000_000L else 83_333_333L
+                )
+            }
+            cur.copy(
+                manualExposureEnabled = true,
+                iso = clampedIso,
+                exposureTimeNs = nextExp
+            )
+        }
+    }
+
+    fun setEvCompensationSteps(steps: Int) {
+        updateProControls {
+            it.copy(
+                manualExposureEnabled = false,
+                manualShutterPinned = false,
+                exposureCompensationSteps = steps
+            )
+        }
+    }
+
+    fun toggle3x3GridQuick() {
+        val current = settings.value.gridOverlay
+        val next = if (current == GridOverlayType.RULE_OF_THIRDS) GridOverlayType.NONE
+        else GridOverlayType.RULE_OF_THIRDS
+        viewModelScope.launch {
+            settingsManager.setGridOverlay(next)
+        }
     }
 
     fun triggerCaptureOrRecord() {
@@ -471,15 +570,28 @@ class MainViewModel(application: Application) : AndroidViewModel(application) {
     }
 
     fun updateVideoSettings(transform: (VideoSettingsUiState) -> VideoSettingsUiState) {
-        val next = transform(_videoSettings.value)
-        _videoSettings.value = next
+        val prev = _videoSettings.value
+        val rawNext = transform(prev)
+        val cam = activeCamera.value
+        val clampedNext = if (cam != null) {
+            rawNext.copy(
+                selectedFps = clampVideoFpsForSize(cam, rawNext.selectedSize, rawNext.selectedFps),
+                eisEnabled = rawNext.eisEnabled && cam.supportsEis
+            )
+        } else rawNext
+        _videoSettings.value = clampedNext
+        val isVideoMode = _currentDestination.value == AppDestination.VIDEO ||
+            _currentDestination.value == AppDestination.SLOW_MOTION
         viewModelScope.launch {
             cameraController.reconfigureForState(
                 mode = _currentDestination.value,
                 controls = _proControls.value,
                 settings = settings.value,
                 toolMode = _photoToolMode.value,
-                eisEnabled = next.eisEnabled
+                eisEnabled = clampedNext.eisEnabled,
+                selectedVideoSize = clampedNext.selectedSize,
+                selectedVideoFps = clampedNext.selectedFps,
+                recreateSession = isVideoMode && prev.selectedSize != clampedNext.selectedSize
             )
         }
     }
@@ -548,7 +660,8 @@ class MainViewModel(application: Application) : AndroidViewModel(application) {
         val next = transform(_studioParams.value)
         _studioParams.value = next
         val orig = _studioOriginalBitmap.value ?: return
-        viewModelScope.launch {
+        studioRenderJob?.cancel()
+        studioRenderJob = viewModelScope.launch {
             _studioRenderedBitmap.value = imageEditorEngine.renderPreview(orig, next)
         }
     }

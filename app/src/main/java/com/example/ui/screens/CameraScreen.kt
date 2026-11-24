@@ -40,13 +40,16 @@ import androidx.compose.foundation.layout.windowInsetsPadding
 import androidx.compose.foundation.rememberScrollState
 import androidx.compose.foundation.shape.CircleShape
 import androidx.compose.foundation.shape.RoundedCornerShape
+import androidx.compose.foundation.Image
 import androidx.compose.material.icons.Icons
 import androidx.compose.material.icons.filled.AutoAwesome
 import androidx.compose.material.icons.filled.Bolt
 import androidx.compose.material.icons.filled.Cameraswitch
 import androidx.compose.material.icons.filled.CenterFocusStrong
+import androidx.compose.material.icons.filled.CheckCircle
 import androidx.compose.material.icons.filled.Close
 import androidx.compose.material.icons.filled.Contrast
+import androidx.compose.material.icons.filled.Exposure
 import androidx.compose.material.icons.filled.FlashAuto
 import androidx.compose.material.icons.filled.FlashOff
 import androidx.compose.material.icons.filled.FlashOn
@@ -60,16 +63,19 @@ import androidx.compose.material.icons.filled.Timer
 import androidx.compose.material.icons.filled.Tune
 import androidx.compose.material.icons.filled.Warning
 import androidx.compose.ui.graphics.Brush
+import androidx.compose.material3.AlertDialog
 import androidx.compose.material3.Button
 import androidx.compose.material3.ButtonDefaults
 import androidx.compose.material3.CircularProgressIndicator
 import androidx.compose.material3.Icon
 import androidx.compose.material3.IconButton
+import androidx.compose.material3.LinearProgressIndicator
 import androidx.compose.material3.MaterialTheme
 import androidx.compose.material3.Slider
 import androidx.compose.material3.SliderDefaults
 import androidx.compose.material3.Surface
 import androidx.compose.material3.Text
+import androidx.compose.material3.TextButton
 import androidx.compose.material3.minimumInteractiveComponentSize
 import androidx.compose.runtime.Composable
 import androidx.compose.runtime.LaunchedEffect
@@ -82,10 +88,13 @@ import androidx.compose.ui.Modifier
 import androidx.compose.ui.draw.clip
 import androidx.compose.ui.draw.scale
 import androidx.compose.ui.graphics.Color
+import androidx.compose.ui.graphics.asImageBitmap
+import androidx.compose.ui.hapticfeedback.HapticFeedbackType
 import androidx.compose.ui.input.pointer.PointerEventPass
 import androidx.compose.ui.input.pointer.pointerInput
 import androidx.compose.ui.layout.ContentScale
 import androidx.compose.ui.platform.LocalContext
+import androidx.compose.ui.platform.LocalHapticFeedback
 import androidx.compose.ui.platform.testTag
 import androidx.compose.ui.text.font.FontWeight
 import androidx.compose.ui.text.style.TextOverflow
@@ -94,10 +103,15 @@ import androidx.core.content.ContextCompat
 import androidx.lifecycle.compose.collectAsStateWithLifecycle
 import coil.compose.AsyncImage
 import com.example.camera.AppDestination
+import com.example.camera.BackgroundProcessingJob
+import com.example.camera.BackgroundProcessingStage
 import com.example.camera.CameraPreview
 import com.example.camera.FlashMode
 import com.example.camera.FocusPeakingColor
 import com.example.camera.FocusPeakingSensitivity
+import com.example.camera.GridLineColor
+import com.example.camera.GridLineThickness
+import com.example.camera.GridOverlayConfig
 import com.example.camera.GridOverlayType
 import com.example.camera.LensRole
 import com.example.camera.PhotoToolMode
@@ -109,6 +123,7 @@ import com.example.ui.MainViewModel
 import com.example.ui.components.AudioLevelMeterBar
 import com.example.ui.components.CameraLabSheet
 import com.example.ui.components.LiveHistogramOverlay
+import com.example.ui.components.LowLightExposureIsoStrip
 import com.example.ui.components.ProControlsBar
 import com.example.ui.components.ProPillButton
 import com.example.ui.components.VideoControlsBar
@@ -135,6 +150,7 @@ fun CameraScreen(
     modifier: Modifier = Modifier
 ) {
     val context = LocalContext.current
+    val haptic = LocalHapticFeedback.current
     val currentDest by viewModel.currentDestination.collectAsStateWithLifecycle()
     val settings by viewModel.settings.collectAsStateWithLifecycle()
     val health by viewModel.healthState.collectAsStateWithLifecycle()
@@ -146,6 +162,7 @@ fun CameraScreen(
     val videoSettings by viewModel.videoSettings.collectAsStateWithLifecycle()
     val videoRecState by viewModel.videoRecordingState.collectAsStateWithLifecycle()
     val galleryItems by viewModel.galleryItems.collectAsStateWithLifecycle()
+    val processingJobs by viewModel.processingJobs.collectAsStateWithLifecycle()
 
     val previewSize by viewModel.cameraController.previewSize.collectAsStateWithLifecycle()
     val telemetry by viewModel.cameraController.telemetry.collectAsStateWithLifecycle()
@@ -167,10 +184,14 @@ fun CameraScreen(
     var showOverlayPanel by remember { mutableStateOf(false) }
     var showCameraLab by remember { mutableStateOf(false) }
     var showLiveTonePanel by remember { mutableStateOf(false) }
+    var showEvIsoPanel by remember { mutableStateOf(false) }
+    var showProcessingSheet by remember { mutableStateOf(false) }
 
-    BackHandler(enabled = showOverlayPanel || showLiveTonePanel || showCameraLab) {
+    BackHandler(enabled = showOverlayPanel || showLiveTonePanel || showEvIsoPanel || showCameraLab || showProcessingSheet) {
         when {
+            showProcessingSheet -> showProcessingSheet = false
             showCameraLab -> showCameraLab = false
+            showEvIsoPanel -> showEvIsoPanel = false
             showLiveTonePanel -> showLiveTonePanel = false
             showOverlayPanel -> showOverlayPanel = false
         }
@@ -260,6 +281,14 @@ fun CameraScreen(
             isFrontCamera = activeCam?.lensRole == LensRole.FRONT,
             telemetry = telemetry,
             gridType = settings.gridOverlay,
+            gridConfig = GridOverlayConfig(
+                type = settings.gridOverlay,
+                opacity = settings.gridOpacity,
+                thickness = settings.gridThickness,
+                color = settings.gridColor,
+                showDiagonals = settings.gridShowDiagonals,
+                showIntersectionDots = settings.gridShowIntersectionDots
+            ),
             showDigitalLevel = settings.showDigitalLevel,
             peakingBitmap = if (settings.focusPeakingEnabled) peakingBmp else null,
             zebraBitmap = if (settings.zebraWarningsEnabled) zebraBmp else null,
@@ -271,8 +300,18 @@ fun CameraScreen(
             aiAutoAdjustEnabled = settings.aiAssistantEnabled && settings.aiAutoAdjustEnabled,
             onSurfaceTextureReady = { st -> viewModel.attachPreviewTexture(st) },
             onSurfaceTextureDestroyed = { st -> viewModel.detachPreviewTexture(st) },
-            onTapFocus = { x, y -> viewModel.cameraController.triggerTapToFocus(x, y, lockAeAf = false) },
-            onLongPressLock = { x, y -> viewModel.cameraController.triggerTapToFocus(x, y, lockAeAf = true) },
+            onTapFocus = { x, y ->
+                if (settings.hapticShutterFeedback) {
+                    haptic.performHapticFeedback(HapticFeedbackType.TextHandleMove)
+                }
+                viewModel.cameraController.triggerTapToFocus(x, y, lockAeAf = false)
+            },
+            onLongPressLock = { x, y ->
+                if (settings.hapticShutterFeedback) {
+                    haptic.performHapticFeedback(HapticFeedbackType.LongPress)
+                }
+                viewModel.cameraController.triggerTapToFocus(x, y, lockAeAf = true)
+            },
             onPinchZoomDelta = { delta ->
                 val maxZ = activeCam?.maxDigitalZoom ?: 4f
                 viewModel.updateProControls {
@@ -515,6 +554,110 @@ fun CameraScreen(
                     }
                 }
 
+                // 1-tap 3x3 Composition Grid quick pill
+                val is3x3Active = settings.gridOverlay == GridOverlayType.RULE_OF_THIRDS
+                Surface(
+                    color = if (is3x3Active) AmberFocus.copy(alpha = 0.20f) else CarbonSurface.copy(alpha = 0.82f),
+                    shape = RoundedCornerShape(10.dp),
+                    border = androidx.compose.foundation.BorderStroke(
+                        1.dp,
+                        if (is3x3Active) AmberFocus else GraphiteBorder
+                    ),
+                    modifier = Modifier
+                        .clickable { viewModel.toggle3x3GridQuick() }
+                        .testTag("quick_3x3_grid_toggle")
+                ) {
+                    Row(
+                        modifier = Modifier.padding(horizontal = 9.dp, vertical = 6.dp),
+                        verticalAlignment = Alignment.CenterVertically,
+                        horizontalArrangement = Arrangement.spacedBy(4.dp)
+                    ) {
+                        Icon(
+                            imageVector = Icons.Filled.GridOn,
+                            contentDescription = strings.gridLabel,
+                            tint = if (is3x3Active) AmberFocus else TextPrimary,
+                            modifier = Modifier.size(14.dp)
+                        )
+                        Text(
+                            text = strings.grid3x3QuickLabel,
+                            style = MaterialTheme.typography.labelSmall,
+                            fontWeight = if (is3x3Active) FontWeight.Bold else FontWeight.Medium,
+                            color = if (is3x3Active) AmberFocus else TextPrimary
+                        )
+                    }
+                }
+
+                // 1-tap EV / Low-Light ISO quick toggle pill
+                val evIsoHighlighted = showEvIsoPanel || proControls.manualExposureEnabled || proControls.exposureCompensationSteps != 0
+                Surface(
+                    color = if (evIsoHighlighted) SapphireTelemetry.copy(alpha = 0.22f) else CarbonSurface.copy(alpha = 0.82f),
+                    shape = RoundedCornerShape(10.dp),
+                    border = androidx.compose.foundation.BorderStroke(
+                        1.dp,
+                        if (evIsoHighlighted) SapphireTelemetry else GraphiteBorder
+                    ),
+                    modifier = Modifier
+                        .clickable { showEvIsoPanel = !showEvIsoPanel }
+                        .testTag("quick_ev_iso_toggle")
+                ) {
+                    Row(
+                        modifier = Modifier.padding(horizontal = 9.dp, vertical = 6.dp),
+                        verticalAlignment = Alignment.CenterVertically,
+                        horizontalArrangement = Arrangement.spacedBy(4.dp)
+                    ) {
+                        Icon(
+                            imageVector = Icons.Filled.Exposure,
+                            contentDescription = strings.exposureIsoTitle,
+                            tint = if (evIsoHighlighted) SapphireTelemetry else TextPrimary,
+                            modifier = Modifier.size(14.dp)
+                        )
+                        Text(
+                            text = if (proControls.manualExposureEnabled) "ISO ${proControls.iso}"
+                            else "${strings.evLabel}/${strings.isoLabel}",
+                            style = MaterialTheme.typography.labelSmall,
+                            fontWeight = if (evIsoHighlighted) FontWeight.Bold else FontWeight.Medium,
+                            color = if (evIsoHighlighted) SapphireTelemetry else TextPrimary
+                        )
+                    }
+                }
+
+                // 1-tap Focus Peaking quick pill
+                val peakTint = Color(settings.focusPeakingColor.argb)
+                Surface(
+                    color = if (settings.focusPeakingEnabled) peakTint.copy(alpha = 0.22f) else CarbonSurface.copy(alpha = 0.82f),
+                    shape = RoundedCornerShape(10.dp),
+                    border = androidx.compose.foundation.BorderStroke(
+                        1.dp,
+                        if (settings.focusPeakingEnabled) peakTint else GraphiteBorder
+                    ),
+                    modifier = Modifier
+                        .clickable {
+                            viewModel.updateSettings {
+                                setOverlays(focusPeaking = !settings.focusPeakingEnabled)
+                            }
+                        }
+                        .testTag("quick_focus_peaking_toggle")
+                ) {
+                    Row(
+                        modifier = Modifier.padding(horizontal = 9.dp, vertical = 6.dp),
+                        verticalAlignment = Alignment.CenterVertically,
+                        horizontalArrangement = Arrangement.spacedBy(4.dp)
+                    ) {
+                        Icon(
+                            imageVector = Icons.Filled.CenterFocusStrong,
+                            contentDescription = strings.focusPeaking,
+                            tint = if (settings.focusPeakingEnabled) peakTint else TextPrimary,
+                            modifier = Modifier.size(14.dp)
+                        )
+                        Text(
+                            text = strings.focusPeaking,
+                            style = MaterialTheme.typography.labelSmall,
+                            fontWeight = if (settings.focusPeakingEnabled) FontWeight.Bold else FontWeight.Medium,
+                            color = if (settings.focusPeakingEnabled) peakTint else TextPrimary
+                        )
+                    }
+                }
+
                 // Hardware Diagnostics Shortcut
                 Surface(
                     color = CarbonSurface.copy(alpha = 0.82f),
@@ -584,14 +727,72 @@ fun CameraScreen(
                         .padding(8.dp),
                     horizontalArrangement = Arrangement.spacedBy(6.dp)
                 ) {
+                    val gridTitle = if (strings.isArabic) settings.gridOverlay.labelAr else settings.gridOverlay.labelEn
                     ProPillButton(
-                        label = "${strings.gridLabel}: ${settings.gridOverlay.name.take(5)}",
+                        label = "${strings.gridLabel}: $gridTitle",
                         selected = settings.gridOverlay != GridOverlayType.NONE,
+                        testTag = "overlay_grid_cycle_pill",
                         onClick = {
                             val next = GridOverlayType.entries[(settings.gridOverlay.ordinal + 1) % GridOverlayType.entries.size]
                             viewModel.updateSettings { setGridOverlay(next) }
                         }
                     )
+                    if (settings.gridOverlay != GridOverlayType.NONE) {
+                        val opacityLevels = listOf(0.25f, 0.50f, 0.75f, 0.90f)
+                        val nextOpacity = opacityLevels.firstOrNull { it > settings.gridOpacity + 0.05f } ?: opacityLevels.first()
+                        ProPillButton(
+                            label = "${(settings.gridOpacity * 100).toInt()}%",
+                            selected = true,
+                            activeColor = Color(settings.gridColor.argb),
+                            testTag = "overlay_grid_opacity_pill",
+                            onClick = {
+                                viewModel.updateSettings { setGridConfig(opacity = nextOpacity) }
+                            }
+                        )
+                        val nextThickness = GridLineThickness.entries[
+                            (settings.gridThickness.ordinal + 1) % GridLineThickness.entries.size
+                        ]
+                        ProPillButton(
+                            label = if (strings.isArabic) settings.gridThickness.labelAr else settings.gridThickness.labelEn,
+                            selected = true,
+                            testTag = "overlay_grid_thickness_pill",
+                            onClick = {
+                                viewModel.updateSettings { setGridConfig(thickness = nextThickness) }
+                            }
+                        )
+                        val nextGridColor = GridLineColor.entries[
+                            (settings.gridColor.ordinal + 1) % GridLineColor.entries.size
+                        ]
+                        ProPillButton(
+                            label = if (strings.isArabic) settings.gridColor.labelAr else settings.gridColor.labelEn,
+                            selected = settings.gridColor != GridLineColor.WHITE,
+                            activeColor = Color(settings.gridColor.argb),
+                            testTag = "overlay_grid_color_pill",
+                            onClick = {
+                                viewModel.updateSettings { setGridConfig(color = nextGridColor) }
+                            }
+                        )
+                        if (settings.gridOverlay == GridOverlayType.RULE_OF_THIRDS) {
+                            ProPillButton(
+                                label = strings.gridDiagonalsLabel,
+                                selected = settings.gridShowDiagonals,
+                                activeColor = AmberFocus,
+                                testTag = "overlay_grid_diagonals_pill",
+                                onClick = {
+                                    viewModel.updateSettings { setGridConfig(showDiagonals = !settings.gridShowDiagonals) }
+                                }
+                            )
+                            ProPillButton(
+                                label = strings.gridIntersectionDotsLabel,
+                                selected = settings.gridShowIntersectionDots,
+                                activeColor = AmberFocus,
+                                testTag = "overlay_grid_points_pill",
+                                onClick = {
+                                    viewModel.updateSettings { setGridConfig(showIntersectionDots = !settings.gridShowIntersectionDots) }
+                                }
+                            )
+                        }
+                    }
                     ProPillButton(
                         label = strings.histogramLabel,
                         selected = settings.showHistogram,
@@ -744,6 +945,28 @@ fun CameraScreen(
                 }
             }
 
+            // Expandable Low-Light EV Compensation & ISO Adjustment Drawer (in Camera / HDR / Video)
+            AnimatedVisibility(visible = showEvIsoPanel && currentDest != AppDestination.NIGHT && currentDest != AppDestination.PRO) {
+                val cam = activeCam
+                if (cam != null) {
+                    LowLightExposureIsoStrip(
+                        cam = cam,
+                        proControls = proControls,
+                        telemetryIso = telemetry.iso,
+                        telemetryExpNs = telemetry.exposureTimeNs,
+                        strings = strings,
+                        onSetEvSteps = { viewModel.setEvCompensationSteps(it) },
+                        onSelectIso = { viewModel.applyIsoAdjustment(it) },
+                        modifier = Modifier
+                            .fillMaxWidth()
+                            .clip(RoundedCornerShape(12.dp))
+                            .background(CarbonSurface.copy(alpha = 0.92f))
+                            .border(1.dp, SapphireTelemetry.copy(alpha = 0.7f), RoundedCornerShape(12.dp))
+                            .padding(horizontal = 12.dp, vertical = 8.dp)
+                    )
+                }
+            }
+
             // Secondary HUD Row: Histogram + Warnings + AI Scene Pill + Video Timer/Audio Meter
             Row(
                 modifier = Modifier.fillMaxWidth(),
@@ -770,6 +993,14 @@ fun CameraScreen(
                             text = "${"%.1f".format(proControls.digitalZoomRatio)}x · ${strings.digitalZoomWarning}",
                             color = AmberFocus
                         )
+                    }
+
+                    if (proControls.afLocked) {
+                        HudBadge(text = strings.afLockLabel, color = EmeraldLock)
+                    }
+
+                    if (settings.superResolutionEnabled && currentDest == AppDestination.CAMERA) {
+                        HudBadge(text = "SR 1.5x", color = SapphireTelemetry)
                     }
 
                     if (health.thermalSeverity.ordinal >= ThermalSeverity.MODERATE.ordinal) {
@@ -927,6 +1158,39 @@ fun CameraScreen(
             }
         }
 
+        // Subtle non-blocking background processing indicator chip (clickable anytime, never freezes screen)
+        if (processingJobs.isNotEmpty()) {
+            val activeJob = processingJobs.last()
+            Row(
+                modifier = Modifier
+                    .align(Alignment.TopStart)
+                    .windowInsetsPadding(WindowInsets.statusBars)
+                    .padding(start = 12.dp, top = 112.dp)
+                    .clip(RoundedCornerShape(14.dp))
+                    .background(ObsidianVoid.copy(alpha = 0.84f))
+                    .border(1.dp, AmberFocus.copy(alpha = 0.85f), RoundedCornerShape(14.dp))
+                    .clickable { showProcessingSheet = true }
+                    .padding(horizontal = 10.dp, vertical = 6.dp)
+                    .testTag("background_processing_pill"),
+                verticalAlignment = Alignment.CenterVertically,
+                horizontalArrangement = Arrangement.spacedBy(7.dp)
+            ) {
+                CircularProgressIndicator(
+                    progress = { activeJob.progress },
+                    color = AmberFocus,
+                    trackColor = GraphiteBorder,
+                    strokeWidth = 2.4.dp,
+                    modifier = Modifier.size(16.dp)
+                )
+                Text(
+                    text = "${activeJob.modeTag} · ${(activeJob.progress * 100).toInt()}%",
+                    style = MaterialTheme.typography.labelSmall,
+                    color = AmberFocus,
+                    fontWeight = FontWeight.Bold
+                )
+            }
+        }
+
         // QR Code Live Result Banner
         qrResult?.let { qr ->
             Row(
@@ -1024,6 +1288,9 @@ fun CameraScreen(
                     focusPeakingColor = settings.focusPeakingColor,
                     focusPeakingSensitivity = settings.focusPeakingSensitivity,
                     focusSharpnessPercent = telemetry.focusSharpnessPercent,
+                    liveIso = telemetry.iso,
+                    liveExposureNs = telemetry.exposureTimeNs,
+                    onSelectIsoPreset = { iso -> viewModel.applyIsoAdjustment(iso) },
                     onToggleFocusPeaking = {
                         viewModel.updateSettings {
                             setOverlays(focusPeaking = !settings.focusPeakingEnabled)
@@ -1047,6 +1314,22 @@ fun CameraScreen(
                     aiAssistantEnabled = settings.aiAssistantEnabled,
                     focusPowerMode = settings.focusPowerMode,
                     aiBitrateMultiplier = aiRec?.profile?.videoBitrateMultiplier ?: 1.15f
+                )
+            } else if (currentDest == AppDestination.NIGHT && cam != null) {
+                LowLightExposureIsoStrip(
+                    cam = cam,
+                    proControls = proControls,
+                    telemetryIso = telemetry.iso,
+                    telemetryExpNs = telemetry.exposureTimeNs,
+                    strings = strings,
+                    onSetEvSteps = { viewModel.setEvCompensationSteps(it) },
+                    onSelectIso = { viewModel.applyIsoAdjustment(it) },
+                    modifier = Modifier
+                        .fillMaxWidth()
+                        .clip(RoundedCornerShape(14.dp))
+                        .background(CarbonSurface.copy(alpha = 0.90f))
+                        .border(1.dp, SapphireTelemetry.copy(alpha = 0.65f), RoundedCornerShape(14.dp))
+                        .padding(horizontal = 10.dp, vertical = 8.dp)
                 )
             } else if (currentDest == AppDestination.CAMERA) {
                 // Quick Photo Tools Strip (Standard, Portrait, Astro, Burst, AEB, Interval, Pano, Doc, QR)
@@ -1208,19 +1491,38 @@ fun CameraScreen(
                 horizontalArrangement = Arrangement.SpaceEvenly,
                 verticalAlignment = Alignment.CenterVertically
             ) {
-                // Gallery Thumbnail
+                // Gallery Thumbnail (shows live processing ring + preview & opens processing status when tapped mid-processing)
+                val activeBgJob = processingJobs.lastOrNull()
                 Box(
                     modifier = Modifier
-                        .size(52.dp)
+                        .size(54.dp)
                         .clip(RoundedCornerShape(12.dp))
                         .background(MachinedSlate)
-                        .border(1.5.dp, GraphiteBorder, RoundedCornerShape(12.dp))
-                        .clickable { viewModel.navigateTo(AppDestination.GALLERY) }
+                        .border(
+                            1.5.dp,
+                            if (activeBgJob != null) AmberFocus else GraphiteBorder,
+                            RoundedCornerShape(12.dp)
+                        )
+                        .clickable {
+                            if (processingJobs.isNotEmpty()) {
+                                showProcessingSheet = true
+                            } else {
+                                viewModel.navigateTo(AppDestination.GALLERY)
+                            }
+                        }
                         .testTag("gallery_thumb_button"),
                     contentAlignment = Alignment.Center
                 ) {
                     val latest = galleryItems.firstOrNull()
-                    if (latest != null) {
+                    val jobBmp = activeBgJob?.previewBitmap
+                    if (jobBmp != null && !jobBmp.isRecycled) {
+                        Image(
+                            bitmap = jobBmp.asImageBitmap(),
+                            contentDescription = strings.processingInProgressTitle,
+                            contentScale = ContentScale.Crop,
+                            modifier = Modifier.fillMaxSize()
+                        )
+                    } else if (latest != null) {
                         AsyncImage(
                             model = latest.uri,
                             contentDescription = strings.modeGallery,
@@ -1233,6 +1535,39 @@ fun CameraScreen(
                             contentDescription = strings.modeGallery,
                             tint = TextSecondary
                         )
+                    }
+
+                    if (activeBgJob != null) {
+                        Box(
+                            modifier = Modifier
+                                .fillMaxSize()
+                                .background(ObsidianVoid.copy(alpha = 0.48f)),
+                            contentAlignment = Alignment.Center
+                        ) {
+                            CircularProgressIndicator(
+                                progress = { activeBgJob.progress },
+                                color = AmberFocus,
+                                trackColor = Color.White.copy(alpha = 0.25f),
+                                strokeWidth = 3.dp,
+                                modifier = Modifier
+                                    .size(28.dp)
+                                    .testTag("gallery_thumb_processing_ring")
+                            )
+                        }
+                        if (processingJobs.size > 1) {
+                            Text(
+                                text = "${processingJobs.size}",
+                                style = MaterialTheme.typography.labelSmall,
+                                color = ObsidianVoid,
+                                fontWeight = FontWeight.Bold,
+                                modifier = Modifier
+                                    .align(Alignment.TopEnd)
+                                    .padding(2.dp)
+                                    .clip(CircleShape)
+                                    .background(AmberFocus)
+                                    .padding(horizontal = 4.dp, vertical = 1.dp)
+                            )
+                        }
                     }
                 }
 
@@ -1279,9 +1614,17 @@ fun CameraScreen(
                         }
                         .combinedClickable(
                             enabled = !isCapturing,
-                            onClick = { viewModel.triggerCaptureOrRecord() },
+                            onClick = {
+                                if (settings.hapticShutterFeedback) {
+                                    haptic.performHapticFeedback(HapticFeedbackType.LongPress)
+                                }
+                                viewModel.triggerCaptureOrRecord()
+                            },
                             onLongClick = {
                                 if (!isVideoTab && panoCount == 0 && intervalProg == null) {
+                                    if (settings.hapticShutterFeedback) {
+                                        haptic.performHapticFeedback(HapticFeedbackType.LongPress)
+                                    }
                                     viewModel.startActionBurst()
                                 }
                             }
@@ -1365,7 +1708,173 @@ fun CameraScreen(
                 onLoadSlot = { slot -> viewModel.loadCustomSlot(slot) }
             )
         }
+
+        if (showProcessingSheet) {
+            ProcessingStatusDialog(
+                jobs = processingJobs,
+                strings = strings,
+                onDismiss = { showProcessingSheet = false },
+                onOpenGallery = {
+                    showProcessingSheet = false
+                    viewModel.navigateTo(AppDestination.GALLERY)
+                }
+            )
+        }
     }
+}
+
+@Composable
+private fun ProcessingStatusDialog(
+    jobs: List<BackgroundProcessingJob>,
+    strings: AppStrings,
+    onDismiss: () -> Unit,
+    onOpenGallery: () -> Unit
+) {
+    AlertDialog(
+        onDismissRequest = onDismiss,
+        containerColor = CarbonSurface,
+        modifier = Modifier.testTag("processing_status_dialog"),
+        title = {
+            Row(
+                verticalAlignment = Alignment.CenterVertically,
+                horizontalArrangement = Arrangement.spacedBy(8.dp)
+            ) {
+                if (jobs.isNotEmpty()) {
+                    CircularProgressIndicator(
+                        color = AmberFocus,
+                        strokeWidth = 2.5.dp,
+                        modifier = Modifier.size(20.dp)
+                    )
+                } else {
+                    Icon(
+                        imageVector = Icons.Filled.CheckCircle,
+                        contentDescription = null,
+                        tint = EmeraldLock,
+                        modifier = Modifier.size(22.dp)
+                    )
+                }
+                Text(
+                    text = strings.processingInProgressTitle,
+                    style = MaterialTheme.typography.titleMedium,
+                    color = AmberFocus
+                )
+            }
+        },
+        text = {
+            Column(verticalArrangement = Arrangement.spacedBy(10.dp)) {
+                Text(
+                    text = strings.processingInProgressDesc,
+                    style = MaterialTheme.typography.bodySmall,
+                    color = TextSecondary
+                )
+                if (jobs.isEmpty()) {
+                    Row(
+                        modifier = Modifier
+                            .fillMaxWidth()
+                            .clip(RoundedCornerShape(10.dp))
+                            .background(MachinedSlate)
+                            .padding(10.dp),
+                        verticalAlignment = Alignment.CenterVertically,
+                        horizontalArrangement = Arrangement.spacedBy(8.dp)
+                    ) {
+                        Icon(Icons.Filled.CheckCircle, contentDescription = null, tint = EmeraldLock)
+                        Text(
+                            text = if (strings.isArabic) "اكتملت المعالجة وتم الحفظ في المعرض" else "Processing complete — Saved to Gallery",
+                            style = MaterialTheme.typography.bodyMedium,
+                            color = TextPrimary
+                        )
+                    }
+                } else {
+                    jobs.forEach { job ->
+                        val stageText = when (job.stage) {
+                            BackgroundProcessingStage.ALIGNING -> strings.aligningFrames
+                            BackgroundProcessingStage.MERGING_HDR -> strings.mergingHdr
+                            BackgroundProcessingStage.MERGING_NIGHT -> strings.mergingNight
+                            BackgroundProcessingStage.SUPER_RES -> strings.superResReconstructing
+                            BackgroundProcessingStage.ENHANCING -> strings.processingStageEnhancing
+                            BackgroundProcessingStage.SAVING -> strings.processingStageSaving
+                        }
+                        Row(
+                            modifier = Modifier
+                                .fillMaxWidth()
+                                .clip(RoundedCornerShape(12.dp))
+                                .background(MachinedSlate)
+                                .border(1.dp, GraphiteBorder, RoundedCornerShape(12.dp))
+                                .padding(10.dp),
+                            verticalAlignment = Alignment.CenterVertically,
+                            horizontalArrangement = Arrangement.spacedBy(10.dp)
+                        ) {
+                            val bmp = job.previewBitmap
+                            if (bmp != null && !bmp.isRecycled) {
+                                Image(
+                                    bitmap = bmp.asImageBitmap(),
+                                    contentDescription = job.modeTag,
+                                    contentScale = ContentScale.Crop,
+                                    modifier = Modifier
+                                        .size(48.dp)
+                                        .clip(RoundedCornerShape(8.dp))
+                                )
+                            }
+                            Column(
+                                modifier = Modifier.weight(1f),
+                                verticalArrangement = Arrangement.spacedBy(4.dp)
+                            ) {
+                                Row(
+                                    modifier = Modifier.fillMaxWidth(),
+                                    horizontalArrangement = Arrangement.SpaceBetween
+                                ) {
+                                    Text(
+                                        text = job.modeTag,
+                                        style = MaterialTheme.typography.labelMedium,
+                                        fontWeight = FontWeight.Bold,
+                                        color = AmberFocus
+                                    )
+                                    Text(
+                                        text = "${(job.progress * 100).toInt()}%",
+                                        style = MaterialTheme.typography.labelSmall,
+                                        color = TextPrimary
+                                    )
+                                }
+                                Text(
+                                    text = stageText,
+                                    style = MaterialTheme.typography.labelSmall,
+                                    color = TextSecondary,
+                                    maxLines = 2,
+                                    overflow = TextOverflow.Ellipsis
+                                )
+                                LinearProgressIndicator(
+                                    progress = { job.progress },
+                                    color = AmberFocus,
+                                    trackColor = ObsidianVoid,
+                                    modifier = Modifier
+                                        .fillMaxWidth()
+                                        .height(5.dp)
+                                        .clip(RoundedCornerShape(4.dp))
+                                )
+                            }
+                        }
+                    }
+                }
+            }
+        },
+        confirmButton = {
+            Button(
+                onClick = onDismiss,
+                colors = ButtonDefaults.buttonColors(containerColor = AmberFocus, contentColor = ObsidianVoid),
+                modifier = Modifier.testTag("processing_dialog_continue_button")
+            ) {
+                Text(strings.continueShootingLabel)
+            }
+        },
+        dismissButton = {
+            TextButton(
+                onClick = onOpenGallery,
+                modifier = Modifier.testTag("processing_dialog_gallery_button")
+            ) {
+                Text(strings.openGalleryLabel, color = SapphireTelemetry)
+            }
+        }
+    )
 }
 
 @Composable

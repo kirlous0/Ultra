@@ -25,8 +25,9 @@ import kotlinx.coroutines.isActive
 import kotlinx.coroutines.launch
 import kotlinx.coroutines.withContext
 import java.io.File
-import java.nio.ByteBuffer
 import java.util.concurrent.atomic.AtomicBoolean
+import java.util.concurrent.atomic.AtomicInteger
+import java.util.concurrent.atomic.AtomicLong
 import kotlin.math.abs
 
 data class VideoRecordingConfig(
@@ -37,6 +38,7 @@ data class VideoRecordingConfig(
     val recordAudio: Boolean,
     val audioSource: AudioSourceOption,
     val eisEnabled: Boolean,
+    val orientationHint: Int = 90,
     val slowMotionFactor: Int = 1, // 1 = normal, 4 = 120fps->30fps slow-mo
     val timeLapseSpeedFactor: Int = 1, // 1 = normal, >1 = time-lapse
     val focusPowerMode: Boolean = false,
@@ -58,6 +60,17 @@ data class VideoRecordingUiState(
 class VideoRecordingEngine(
     private val storageManager: StorageManager
 ) {
+    companion object {
+        /**
+         * Pure helper computing slow-motion / time-lapse presentation timestamp scaling factor.
+         */
+        fun computePtsTimeScale(slowMotionFactor: Int, timeLapseSpeedFactor: Int): Double = when {
+            slowMotionFactor > 1 -> slowMotionFactor.toDouble()
+            timeLapseSpeedFactor > 1 -> 1.0 / timeLapseSpeedFactor.toDouble()
+            else -> 1.0
+        }
+    }
+
     private val _uiState = MutableStateFlow(VideoRecordingUiState())
     val uiState: StateFlow<VideoRecordingUiState> = _uiState.asStateFlow()
 
@@ -71,6 +84,8 @@ class VideoRecordingEngine(
     private var audioTrackIndex = -1
     private val muxerStarted = AtomicBoolean(false)
     private val stopRequested = AtomicBoolean(false)
+    private val firstVideoClockNs = AtomicLong(0L)
+    private val videoFramesWritten = AtomicInteger(0)
     private val muxerLock = Any()
 
     private var tempOutputFile: File? = null
@@ -89,6 +104,8 @@ class VideoRecordingEngine(
             outputFilename = displayName
             stopRequested.set(false)
             muxerStarted.set(false)
+            firstVideoClockNs.set(0L)
+            videoFramesWritten.set(0)
             videoTrackIndex = -1
             audioTrackIndex = -1
 
@@ -124,8 +141,17 @@ class VideoRecordingEngine(
                 )
             }
 
-            muxer = MediaMuxer(tempFile.absolutePath, MediaMuxer.OutputFormat.MUXER_OUTPUT_MPEG_4)
+            muxer = MediaMuxer(tempFile.absolutePath, MediaMuxer.OutputFormat.MUXER_OUTPUT_MPEG_4).apply {
+                val safeHint = ((config.orientationHint % 360) + 360) % 360
+                val normalizedHint = when (safeHint) {
+                    90, 180, 270 -> safeHint
+                    else -> 0
+                }
+                setOrientationHint(normalizedHint)
+            }
             surface
+        }.onFailure {
+            releaseInternal()
         }
     }
 
@@ -169,9 +195,12 @@ class VideoRecordingEngine(
         val channelConfig = AudioFormat.CHANNEL_IN_MONO
         val encoding = AudioFormat.ENCODING_PCM_16BIT
         val minBuf = AudioRecord.getMinBufferSize(sampleRate, channelConfig, encoding)
-            .coerceAtLeast(4096)
+        if (minBuf <= 0) return
+        val allocBuf = minBuf.coerceAtLeast(4096) * 2
 
-        val recorder = AudioRecord(source.mediaRecorderSource, sampleRate, channelConfig, encoding, minBuf * 2)
+        val recorder = runCatching {
+            AudioRecord(source.mediaRecorderSource, sampleRate, channelConfig, encoding, allocBuf)
+        }.getOrNull() ?: return
         if (recorder.state != AudioRecord.STATE_INITIALIZED) {
             recorder.release()
             return
@@ -181,10 +210,16 @@ class VideoRecordingEngine(
         val aFormat = MediaFormat.createAudioFormat(MediaFormat.MIMETYPE_AUDIO_AAC, sampleRate, 1).apply {
             setInteger(MediaFormat.KEY_AAC_PROFILE, MediaCodecInfo.CodecProfileLevel.AACObjectLC)
             setInteger(MediaFormat.KEY_BIT_RATE, aacBitrate)
-            setInteger(MediaFormat.KEY_MAX_INPUT_SIZE, minBuf * 2)
+            setInteger(MediaFormat.KEY_MAX_INPUT_SIZE, allocBuf)
         }
-        val aEnc = MediaCodec.createEncoderByType(MediaFormat.MIMETYPE_AUDIO_AAC)
-        aEnc.configure(aFormat, null, null, MediaCodec.CONFIGURE_FLAG_ENCODE)
+        val aEnc = runCatching {
+            MediaCodec.createEncoderByType(MediaFormat.MIMETYPE_AUDIO_AAC).apply {
+                configure(aFormat, null, null, MediaCodec.CONFIGURE_FLAG_ENCODE)
+            }
+        }.getOrElse {
+            recorder.release()
+            return
+        }
 
         audioRecord = recorder
         audioEncoder = aEnc
@@ -196,9 +231,15 @@ class VideoRecordingEngine(
         val hasAudio = audioEncoder != null && audioRecord != null
         val startMs = System.currentTimeMillis()
 
-        vEnc.start()
-        audioEncoder?.start()
-        audioRecord?.startRecording()
+        runCatching {
+            vEnc.start()
+            audioEncoder?.start()
+            audioRecord?.startRecording()
+        }.onFailure {
+            releaseInternal()
+            _uiState.value = VideoRecordingUiState(isRecording = false, elapsedMs = 0L, audioLevelNormalized = 0f)
+            return
+        }
 
         _uiState.value = VideoRecordingUiState(isRecording = true, elapsedMs = 0L, audioLevelNormalized = 0f)
 
@@ -227,14 +268,23 @@ class VideoRecordingEngine(
         audioDrainJob?.join()
         timerJob?.cancel()
 
+        val hasValidStream = muxerStarted.get() && videoFramesWritten.get() > 0
         val tempFile = tempOutputFile
         val name = outputFilename
         releaseInternal()
         _uiState.value = VideoRecordingUiState(isRecording = false, elapsedMs = 0L, audioLevelNormalized = 0f)
 
-        if (tempFile != null && name.isNotBlank()) {
+        if (!hasValidStream || tempFile == null || !tempFile.exists() || tempFile.length() < 512L) {
+            runCatching { tempFile?.delete() }
+            return@withContext null
+        }
+
+        if (name.isNotBlank()) {
             storageManager.publishVideoFile(tempFile, name, settings)
-        } else null
+        } else {
+            runCatching { tempFile.delete() }
+            null
+        }
     }
 
     private fun drainVideoEncoder(
@@ -245,53 +295,61 @@ class VideoRecordingEngine(
         val info = MediaCodec.BufferInfo()
         var firstPtsUs = -1L
         var lastWrittenPtsUs = -1L
-        val timeScale = when {
-            config.slowMotionFactor > 1 -> config.slowMotionFactor.toDouble()
-            config.timeLapseSpeedFactor > 1 -> 1.0 / config.timeLapseSpeedFactor.toDouble()
-            else -> 1.0
-        }
+        val timeScale = computePtsTimeScale(config.slowMotionFactor, config.timeLapseSpeedFactor)
 
-        while (true) {
-            val outIndex = encoder.dequeueOutputBuffer(info, 12_000L)
-            when {
-                outIndex == MediaCodec.INFO_OUTPUT_FORMAT_CHANGED -> {
-                    synchronized(muxerLock) {
-                        if (videoTrackIndex == -1) {
-                            videoTrackIndex = muxer?.addTrack(encoder.outputFormat) ?: -1
-                            maybeStartMuxer(expectAudioTrack)
-                        }
-                    }
-                }
-                outIndex >= 0 -> {
-                    val outBuf = encoder.getOutputBuffer(outIndex)
-                    if (outBuf != null && info.size > 0 &&
-                        (info.flags and MediaCodec.BUFFER_FLAG_CODEC_CONFIG) == 0
-                    ) {
-                        if (firstPtsUs < 0L) firstPtsUs = info.presentationTimeUs
-                        val scaledPts = ((info.presentationTimeUs - firstPtsUs) * timeScale).toLong()
-                        // Skip duplicate timestamps during fast time-lapse
-                        if (scaledPts > lastWrittenPtsUs || lastWrittenPtsUs < 0L) {
-                            info.presentationTimeUs = scaledPts
-                            waitForMuxerStart(expectAudioTrack)
-                            synchronized(muxerLock) {
-                                if (muxerStarted.get() && videoTrackIndex >= 0) {
-                                    outBuf.position(info.offset)
-                                    outBuf.limit(info.offset + info.size)
-                                    muxer?.writeSampleData(videoTrackIndex, outBuf, info)
-                                    lastWrittenPtsUs = scaledPts
-                                }
+        var stopIdleRetries = 0
+        try {
+            while (true) {
+                val outIndex = encoder.dequeueOutputBuffer(info, 12_000L)
+                when {
+                    outIndex == MediaCodec.INFO_OUTPUT_FORMAT_CHANGED -> {
+                        synchronized(muxerLock) {
+                            if (videoTrackIndex == -1) {
+                                videoTrackIndex = muxer?.addTrack(encoder.outputFormat) ?: -1
+                                maybeStartMuxer(expectAudioTrack)
                             }
                         }
                     }
-                    encoder.releaseOutputBuffer(outIndex, false)
-                    if ((info.flags and MediaCodec.BUFFER_FLAG_END_OF_STREAM) != 0) break
-                }
-                outIndex == MediaCodec.INFO_TRY_AGAIN_LATER -> {
-                    if (stopRequested.get()) {
-                        // Continue draining until EOS
+                    outIndex >= 0 -> {
+                        stopIdleRetries = 0
+                        val outBuf = encoder.getOutputBuffer(outIndex)
+                        if (outBuf != null && info.size > 0 &&
+                            (info.flags and MediaCodec.BUFFER_FLAG_CODEC_CONFIG) == 0
+                        ) {
+                            if (firstPtsUs < 0L) {
+                                firstPtsUs = info.presentationTimeUs
+                                firstVideoClockNs.compareAndSet(0L, System.nanoTime())
+                            }
+                            val scaledPts = ((info.presentationTimeUs - firstPtsUs) * timeScale).toLong()
+                                .coerceAtLeast(0L)
+                            // Skip duplicate timestamps during fast time-lapse
+                            if (scaledPts > lastWrittenPtsUs || lastWrittenPtsUs < 0L) {
+                                info.presentationTimeUs = scaledPts
+                                waitForMuxerStart(expectAudioTrack)
+                                synchronized(muxerLock) {
+                                    if (muxerStarted.get() && videoTrackIndex >= 0) {
+                                        outBuf.position(info.offset)
+                                        outBuf.limit(info.offset + info.size)
+                                        muxer?.writeSampleData(videoTrackIndex, outBuf, info)
+                                        lastWrittenPtsUs = scaledPts
+                                        videoFramesWritten.incrementAndGet()
+                                    }
+                                }
+                            }
+                        }
+                        encoder.releaseOutputBuffer(outIndex, false)
+                        if ((info.flags and MediaCodec.BUFFER_FLAG_END_OF_STREAM) != 0) break
+                    }
+                    outIndex == MediaCodec.INFO_TRY_AGAIN_LATER -> {
+                        if (stopRequested.get()) {
+                            stopIdleRetries++
+                            if (stopIdleRetries > 75) break
+                        }
                     }
                 }
             }
+        } catch (_: Throwable) {
+            // Prevent background codec/muxer exception from crashing camera lifecycle
         }
     }
 
@@ -300,34 +358,45 @@ class VideoRecordingEngine(
         val encoder = audioEncoder ?: return
         val pcmBuf = ByteArray(2048)
         val info = MediaCodec.BufferInfo()
-        val startNs = System.nanoTime()
+        var lastAudioPtsUs = -1L
 
-        while (!stopRequested.get()) {
-            val read = recorder.read(pcmBuf, 0, pcmBuf.size)
-            if (read > 0) {
-                updateAudioMeter(pcmBuf, read)
-                val inIdx = encoder.dequeueInputBuffer(5_000L)
-                if (inIdx >= 0) {
-                    val inBuf = encoder.getInputBuffer(inIdx)
-                    if (inBuf != null) {
-                        inBuf.clear()
-                        val toPut = minOf(read, inBuf.remaining())
-                        inBuf.put(pcmBuf, 0, toPut)
-                        val ptsUs = (System.nanoTime() - startNs) / 1000L
-                        encoder.queueInputBuffer(inIdx, 0, toPut, ptsUs, 0)
+        try {
+            while (!stopRequested.get()) {
+                val read = recorder.read(pcmBuf, 0, pcmBuf.size)
+                if (read > 0) {
+                    updateAudioMeter(pcmBuf, read)
+                    // Wait for video frame #1 clock before queuing audio so A/V start cleanly at 0us
+                    val vClock = firstVideoClockNs.get()
+                    if (vClock > 0L) {
+                        val inIdx = encoder.dequeueInputBuffer(5_000L)
+                        if (inIdx >= 0) {
+                            val inBuf = encoder.getInputBuffer(inIdx)
+                            if (inBuf != null) {
+                                inBuf.clear()
+                                val toPut = minOf(read, inBuf.remaining())
+                                inBuf.put(pcmBuf, 0, toPut)
+                                val rawPtsUs = ((System.nanoTime() - vClock) / 1000L).coerceAtLeast(0L)
+                                val monoPtsUs = maxOf(rawPtsUs, lastAudioPtsUs + 1000L)
+                                lastAudioPtsUs = monoPtsUs
+                                encoder.queueInputBuffer(inIdx, 0, toPut, monoPtsUs, 0)
+                            }
+                        }
                     }
                 }
+                drainAudioOutput(encoder, info)
             }
-            drainAudioOutput(encoder, info)
-        }
 
-        // Send EOS to audio encoder
-        val eosIdx = encoder.dequeueInputBuffer(10_000L)
-        if (eosIdx >= 0) {
-            val ptsUs = (System.nanoTime() - startNs) / 1000L
-            encoder.queueInputBuffer(eosIdx, 0, 0, ptsUs, MediaCodec.BUFFER_FLAG_END_OF_STREAM)
+            // Send EOS to audio encoder with bounded drain
+            val eosIdx = encoder.dequeueInputBuffer(10_000L)
+            if (eosIdx >= 0) {
+                val vClock = firstVideoClockNs.get().takeIf { it > 0L } ?: System.nanoTime()
+                val eosPtsUs = maxOf(((System.nanoTime() - vClock) / 1000L).coerceAtLeast(0L), lastAudioPtsUs + 1000L)
+                encoder.queueInputBuffer(eosIdx, 0, 0, eosPtsUs, MediaCodec.BUFFER_FLAG_END_OF_STREAM)
+            }
+            drainAudioOutput(encoder, info, drainUntilEos = true)
+        } catch (_: Throwable) {
+            // Safe background audio shutdown
         }
-        drainAudioOutput(encoder, info, drainUntilEos = true)
     }
 
     private fun drainAudioOutput(
@@ -335,6 +404,7 @@ class VideoRecordingEngine(
         info: MediaCodec.BufferInfo,
         drainUntilEos: Boolean = false
     ) {
+        var eosRetries = 0
         while (true) {
             val outIdx = encoder.dequeueOutputBuffer(info, if (drainUntilEos) 10_000L else 0L)
             when {
@@ -347,6 +417,7 @@ class VideoRecordingEngine(
                     }
                 }
                 outIdx >= 0 -> {
+                    eosRetries = 0
                     val outBuf = encoder.getOutputBuffer(outIdx)
                     if (outBuf != null && info.size > 0 &&
                         (info.flags and MediaCodec.BUFFER_FLAG_CODEC_CONFIG) == 0
@@ -363,7 +434,11 @@ class VideoRecordingEngine(
                     encoder.releaseOutputBuffer(outIdx, false)
                     if ((info.flags and MediaCodec.BUFFER_FLAG_END_OF_STREAM) != 0) break
                 }
-                else -> if (!drainUntilEos) break
+                else -> {
+                    if (!drainUntilEos) break
+                    eosRetries++
+                    if (eosRetries > 45) break
+                }
             }
         }
     }

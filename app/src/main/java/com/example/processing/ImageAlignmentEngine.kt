@@ -40,9 +40,9 @@ class ImageAlignmentEngine {
         }
 
         // Higher-precision proxy alignment when Focus Turbo (100% power) is enabled
-        val proxyW = if (fullPower) 320 else 240
+        val proxyW = if (fullPower) 384 else 300
         val proxyH = (proxyW.toFloat() * frames[0].height / frames[0].width.coerceAtLeast(1))
-            .toInt().coerceIn(120, 420)
+            .toInt().coerceIn(140, 480)
         val scaleToFull = frames[0].width.toFloat() / proxyW
 
         val proxyLumas = ArrayList<IntArray>(frames.size)
@@ -79,7 +79,7 @@ class ImageAlignmentEngine {
         val residuals = ArrayList<Float>(frames.size)
         var maxShiftPx = 0f
 
-        val searchRadius = if (fullPower) 20 else 16
+        val searchRadius = if (fullPower) 22 else 18
         for (i in frames.indices) {
             if (i == refIdx) {
                 shifts.add(0f to 0f)
@@ -101,9 +101,9 @@ class ImageAlignmentEngine {
             if (dist > maxShiftPx) maxShiftPx = dist
         }
 
-        val isTripod = maxShiftPx < 1.8f
+        val isTripod = maxShiftPx < 1.6f
         val avgResidual = residuals.filterIndexed { idx, _ -> idx != refIdx }.average().toFloat()
-        val isUnstable = maxShiftPx > frames[0].width * 0.055f || avgResidual > 36f || maxSharp < 5.5
+        val isUnstable = maxShiftPx > frames[0].width * 0.075f || avgResidual > 42f || maxSharp < 2.8
 
         return AlignmentResult(
             referenceIndex = refIdx,

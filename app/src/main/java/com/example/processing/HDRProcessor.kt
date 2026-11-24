@@ -28,7 +28,8 @@ class HDRProcessor(
         vibranceBoost: Float = 0.16f,
         toneStyle: HdrToneStyle = HdrToneStyle.PIXEL_PUNCH,
         shadowBias: Float = 0f,
-        highlightBias: Float = 0f
+        highlightBias: Float = 0f,
+        enableGhostRejection: Boolean = true
     ): HdrProcessResult {
         require(frames.isNotEmpty()) { "HDR requires at least 1 frame" }
         val ref0 = frames[0]
@@ -97,7 +98,7 @@ class HDRProcessor(
 
                         var weight = wExp * wSat * wContrast
 
-                        if (fIdx != refIdx) {
+                        if (enableGhostRejection && fIdx != refIdx) {
                             val refArgb = refPixels[outIdx]
                             val refLuma = YuvUtils.luma(refArgb)
                             val lumaDiff = abs(luma - refLuma)
@@ -111,7 +112,7 @@ class HDRProcessor(
                                 weight *= 0.25f
                             }
                             localSamples++
-                        } else {
+                        } else if (fIdx == refIdx) {
                             weight = weight.coerceAtLeast(0.08f)
                         }
 

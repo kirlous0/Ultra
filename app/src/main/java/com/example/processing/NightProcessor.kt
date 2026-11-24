@@ -28,7 +28,8 @@ class NightProcessor(
     fun processNight(
         frames: List<Bitmap>,
         fullPower: Boolean = false,
-        astroMode: Boolean = false
+        astroMode: Boolean = false,
+        lowLightBoost: Boolean = true
     ): NightProcessResult {
         require(frames.isNotEmpty()) { "Night processor requires at least 1 frame" }
         val w = frames[0].width
@@ -38,7 +39,7 @@ class NightProcessor(
         val bestSharpness = alignment.sharpnessScores.maxOrNull() ?: 1.0
         val refIdx = alignment.referenceIndex
 
-        val sharpThreshold = if (fullPower || astroMode) 0.50 else 0.58
+        val sharpThreshold = if (fullPower || astroMode) 0.48 else 0.55
         val selectedIndices = frames.indices.filter { idx ->
             idx == refIdx || alignment.sharpnessScores[idx] >= bestSharpness * sharpThreshold
         }
@@ -55,7 +56,7 @@ class NightProcessor(
         val framePixels = IntArray(w * h)
         val motionSigma = when {
             astroMode -> 22f
-            fullPower -> 28f
+            fullPower -> 29f
             else -> 26f
         }
 
@@ -98,33 +99,69 @@ class NightProcessor(
             }
         }
 
-        // Low-light / Astro shadow reconstruction + highlight/starlight protection
+        // Measure merged frame illumination & color cast on strided grid
+        var sumR = 0.0
+        var sumG = 0.0
+        var sumB = 0.0
+        var sampleCount = 0L
+        val step = 12
+        var sy = 0
+        while (sy < h) {
+            val row = sy * w
+            var sx = 0
+            while (sx < w) {
+                val i = row + sx
+                val invW = 1f / accumW[i].coerceAtLeast(1e-4f)
+                sumR += (accumR[i] * invW) / 255.0
+                sumG += (accumG[i] * invW) / 255.0
+                sumB += (accumB[i] * invW) / 255.0
+                sampleCount++
+                sx += step
+            }
+            sy += step
+        }
+        val cnt = sampleCount.coerceAtLeast(1L).toFloat()
+        val meanR = (sumR / cnt).toFloat().coerceAtLeast(0.02f)
+        val meanG = (sumG / cnt).toFloat().coerceAtLeast(0.02f)
+        val meanB = (sumB / cnt).toFloat().coerceAtLeast(0.02f)
+        val avgLumaNorm = (0.299f * meanR + 0.587f * meanG + 0.114f * meanB).coerceIn(0.02f, 1f)
+
+        // Gentle 18% residual gray-world WB cast damping when artificial dim light skews channels
+        val gray = ((meanR + meanG + meanB) / 3f).coerceAtLeast(0.04f)
+        val wbMix = if (lowLightBoost && avgLumaNorm < 0.42f) 0.20f else 0f
+        val rWbGain = (1f + ((gray / meanR).coerceIn(0.75f, 1.35f) - 1f) * wbMix)
+        val gWbGain = (1f + ((gray / meanG).coerceIn(0.82f, 1.22f) - 1f) * wbMix)
+        val bWbGain = (1f + ((gray / meanB).coerceIn(0.75f, 1.35f) - 1f) * wbMix)
+
+        // Adaptive low-light / Astro shadow reconstruction + highlight/starlight protection
         val mergedR = IntArray(w * h)
         val mergedG = IntArray(w * h)
         val mergedB = IntArray(w * h)
 
+        val dimExtra = if (lowLightBoost && avgLumaNorm < 0.22f) 0.04f else 0f
         val shadowLiftGamma = when {
-            astroMode -> 0.68f
-            alignment.isTripodStatic -> 0.72f
-            else -> 0.77f
-        }
+            astroMode -> 0.65f
+            alignment.isTripodStatic -> (0.71f - dimExtra)
+            else -> (0.76f - dimExtra)
+        }.coerceIn(0.62f, 0.84f)
+
         ParallelCompute.parallelRows(h, fullPower || astroMode) { startY, endY ->
             for (y in startY until endY) {
                 val off = y * w
                 for (x in 0 until w) {
                     val i = off + x
                     val invW = 1f / accumW[i].coerceAtLeast(1e-4f)
-                    val nr = (accumR[i] * invW) / 255f
-                    val ng = (accumG[i] * invW) / 255f
-                    val nb = (accumB[i] * invW) / 255f
+                    val nr = ((accumR[i] * invW) / 255f * rWbGain).coerceIn(0f, 1f)
+                    val ng = ((accumG[i] * invW) / 255f * gWbGain).coerceIn(0f, 1f)
+                    val nb = ((accumB[i] * invW) / 255f * bWbGain).coerceIn(0f, 1f)
 
                     val luma = 0.299f * nr + 0.587f * ng + 0.114f * nb
-                    val highlightGuard = (1f - luma).coerceIn(0.16f, 1f)
-                    val gain = if (luma > 0.01f) {
-                        val targetLuma = (luma.pow(shadowLiftGamma) * (0.86f + 0.28f * highlightGuard))
+                    val highlightGuard = (1f - luma).coerceIn(0.18f, 1f)
+                    val gain = if (luma > 0.008f) {
+                        val targetLuma = (luma.pow(shadowLiftGamma) * (0.88f + 0.28f * highlightGuard))
                             .coerceIn(0f, 1f)
-                        (targetLuma / luma).coerceIn(0.85f, if (astroMode) 2.60f else 2.35f)
-                    } else 1.18f
+                        (targetLuma / luma).coerceIn(0.84f, if (astroMode) 2.75f else if (lowLightBoost) 2.55f else 2.30f)
+                    } else 1.22f
 
                     mergedR[i] = (nr * gain * 255f).roundToInt().coerceIn(0, 255)
                     mergedG[i] = (ng * gain * 255f).roundToInt().coerceIn(0, 255)
@@ -133,10 +170,10 @@ class NightProcessor(
             }
         }
 
-        // Spatial bilateral denoise (5x5 in fullPower mode, 3x3 cross in standard)
+        // Spatial bilateral denoise (5x5 in fullPower/lowLightBoost, 3x3 cross otherwise) with strict edge preservation
         val outPixels = IntArray(w * h)
-        val radius = if (fullPower) 2 else 1
-        ParallelCompute.parallelRows(h, fullPower) { startY, endY ->
+        val radius = if (fullPower || lowLightBoost) 2 else 1
+        ParallelCompute.parallelRows(h, fullPower || astroMode) { startY, endY ->
             for (y in startY until endY) {
                 for (x in 0 until w) {
                     val idx = y * w + x
@@ -145,20 +182,19 @@ class NightProcessor(
                     val cb = mergedB[idx]
                     val cLuma = (cr * 77 + cg * 150 + cb * 29) shr 8
 
-                    // Stronger chroma+luma smoothing in dark shadows, stricter edge threshold in bright details
-                    val rangeThreshold = if (cLuma < 50) 28 else 22
+                    val rangeThreshold = if (cLuma < 56) 30 else 22
 
-                    var sumR = cr * 2.5f
-                    var sumG = cg * 2.5f
-                    var sumB = cb * 2.5f
-                    var wSum = 2.5f
+                    var sumR2 = cr * 2.4f
+                    var sumG2 = cg * 2.4f
+                    var sumB2 = cb * 2.4f
+                    var wSum = 2.4f
 
                     for (ky in -radius..radius) {
                         val ny = (y + ky).coerceIn(0, h - 1)
                         val rowOff = ny * w
                         for (kx in -radius..radius) {
                             if (kx == 0 && ky == 0) continue
-                            if (!fullPower && kx != 0 && ky != 0) continue
+                            if (radius == 2 && abs(kx) + abs(ky) > 3) continue
                             val nx = (x + kx).coerceIn(0, w - 1)
                             val nIdx = rowOff + nx
                             val nr = mergedR[nIdx]
@@ -170,21 +206,21 @@ class NightProcessor(
                                 val distW = if (abs(kx) + abs(ky) <= 1) 1.0f else 0.55f
                                 val rangeW = 1f - (diff / rangeThreshold.toFloat())
                                 val nw = distW * rangeW
-                                sumR += nr * nw
-                                sumG += ng * nw
-                                sumB += nb * nw
+                                sumR2 += nr * nw
+                                sumG2 += ng * nw
+                                sumB2 += nb * nw
                                 wSum += nw
                             }
                         }
                     }
 
-                    val avgR = (sumR / wSum).roundToInt()
-                    val avgG = (sumG / wSum).roundToInt()
-                    val avgB = (sumB / wSum).roundToInt()
+                    val avgR = (sumR2 / wSum).roundToInt()
+                    val avgG = (sumG2 / wSum).roundToInt()
+                    val avgB = (sumB2 / wSum).roundToInt()
                     val avgLuma = (avgR * 77 + avgG * 150 + avgB * 29) shr 8
 
                     // Preserve high-frequency luma details while adopting clean denoised chroma
-                    val lumaKeep = if (fullPower && cLuma < 55) 0.72f else 0.92f
+                    val lumaKeep = if (cLuma < 52) 0.76f else 0.94f
                     val dLuma = ((cLuma - avgLuma) * lumaKeep).roundToInt()
                     val fr = (avgR + dLuma).coerceIn(0, 255)
                     val fg = (avgG + dLuma).coerceIn(0, 255)
